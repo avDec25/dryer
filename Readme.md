@@ -69,6 +69,10 @@ The release binary is `target\release\dryer.exe`. It is a single file with no in
 cargo test
 ```
 
+## Changing the icon
+
+Replace `icon.png` (a square picture, 256 px or larger), run `powershell -File tools\make-icon.ps1` to rebuild `icon.ico` from it, then rebuild. The icon is embedded in the exe, used for the tray icon, and shown by Explorer and Task Manager.
+
 ## Tuning the animation
 
 The feel of the motion is set by a few constants at the top of `src\physics.rs`: rope stiffness and sag, swing strength and damping, slide speed, and gust strength and timing. Card sizes and spacing are in `src\card.rs`.
@@ -82,6 +86,9 @@ The feel of the motion is set by a few constants at the top of `src\physics.rs`:
 | `src\ring.rs` | The fixed 10-slot history |
 | `src\sound.rs` | The copy beep (`copy-beep.mp3`, embedded in the exe) |
 | `src\store.rs` | Saving the history to disk (encrypted) and loading it at startup |
+| `build.rs` | Embeds `icon.ico` in the exe as the application icon (no extra tools needed) |
+| `icon.png` / `icon.ico` | The application icon, and the multi-size version of it built from the PNG |
+| `tools\make-icon.ps1` | Rebuilds `icon.ico` from `icon.png` |
 | `src\autostart.rs` | Start at login (the per-user `Run` registry key) |
 | `src\card.rs` | Card sizes, layout along the line, text layout |
 | `src\render.rs` | Direct2D drawing and DirectComposition setup |

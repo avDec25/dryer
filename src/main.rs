@@ -42,7 +42,7 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
 use crate::card::CARD_W;
 use crate::clipboard::{Capture, Clip};
@@ -841,7 +841,7 @@ impl App {
             uID: TRAY_ID,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() },
+            hIcon: app_icon(true),
             ..Default::default()
         };
         let tip: Vec<u16> = "Dryer".encode_utf16().collect();
@@ -880,6 +880,27 @@ impl App {
             let _ = SetForegroundWindow(self.hwnd);
             let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, Some(0), self.hwnd, None);
             let _ = DestroyMenu(menu);
+        }
+    }
+}
+
+/// The application icon embedded in the executable (see build.rs), at the small
+/// (tray) or large size. Windows picks the closest frame and scales it. Falls back to
+/// the generic application icon if it cannot be loaded.
+fn app_icon(small: bool) -> HICON {
+    unsafe {
+        let (cx, cy) = if small {
+            (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON))
+        } else {
+            (GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON))
+        };
+        // Resource id 1 is the icon group; a numeric name is passed as a small "pointer".
+        let loaded = GetModuleHandleW(None).ok().and_then(|module| {
+            LoadImageW(Some(module.into()), PCWSTR(1 as *const u16), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR).ok()
+        });
+        match loaded {
+            Some(handle) => HICON(handle.0),
+            None => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
         }
     }
 }
@@ -995,6 +1016,8 @@ fn main() -> windows::core::Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: app_icon(false),
+            hIconSm: app_icon(true),
             lpszClassName: w!("DryerOverlay"),
             ..Default::default()
         };
