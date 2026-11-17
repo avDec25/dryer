@@ -35,7 +35,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::core::{Interface, Result};
 use windows_numerics::{Matrix3x2, Vector2};
 
-use crate::card::{CARD_W, INSET, STRIP_H, TEXT_PAD, TIME_H, slot_x, text_top};
+use crate::card::{CARD_W, FILE_THUMB_H, INSET, STRIP_H, TEXT_PAD, TIME_H, slot_x, text_top};
 use crate::clipboard::{Clip, Kind};
 use crate::physics::{ROPE_SEGMENTS, Rope};
 use crate::ring::Ring;
@@ -59,6 +59,7 @@ const TEXT: D2D1_COLOR_F = rgba(0.93, 0.93, 0.95, 1.0);
 const MUTED: D2D1_COLOR_F = rgba(0.60, 0.60, 0.66, 1.0);
 const FOLDER: D2D1_COLOR_F = rgba(0.33, 0.62, 0.96, 1.0);
 const FOLDER_TAB: D2D1_COLOR_F = rgba(0.27, 0.53, 0.88, 1.0);
+const DOC: D2D1_COLOR_F = rgba(0.55, 0.60, 0.72, 1.0);
 const ROPE: D2D1_COLOR_F = rgba(0.93, 0.93, 0.95, 0.92);
 const ROPE_SHADOW: D2D1_COLOR_F = rgba(0.0, 0.0, 0.0, 0.35);
 const CLIP_BODY: D2D1_COLOR_F = rgba(0.80, 0.81, 0.84, 1.0);
@@ -395,21 +396,32 @@ impl Scene {
         let time_y = top + h - INSET - TEXT_PAD - TIME_H;
         match clip.kind {
             Kind::Image => {
+                // The picture fills the whole panel.
                 self.fill_rr(rrect(px, py, pw, ph, PANEL_R), PANEL);
-                self.image(clip, px, py, pw, ph)?;
+                self.image(clip, px, py, pw, ph, true)?;
             }
             Kind::Text => {
                 // A notes sheet: yellow strip across the top of the panel.
                 self.fill_rr(rrect(px, py, pw, ph, PANEL_R), NOTE_STRIP);
                 self.fill_rr(rrect(px, py + STRIP_H, pw, ph - STRIP_H, PANEL_R), PANEL);
                 self.fill_rect(px, py + STRIP_H, pw, PANEL_R, PANEL);
-                self.text(clip.layout.as_ref(), text_x, top + text_top(Kind::Text), TEXT);
+                let text_y = top + text_top(clip);
+                self.text(clip.layout.as_ref(), text_x, text_y, TEXT);
                 self.text(clip.time_layout.as_ref(), text_x, time_y, MUTED);
             }
-            Kind::Files => {
+            Kind::Files | Kind::Other => {
                 self.fill_rr(rrect(px, py, pw, ph, PANEL_R), PANEL);
-                self.folder(cx, py + TEXT_PAD);
-                self.text(clip.layout.as_ref(), text_x, top + text_top(Kind::Files), TEXT);
+                if clip.thumb_px.is_some() {
+                    // The file's thumbnail (or icon), whole, above its name.
+                    let (mx, my) = (px + TEXT_PAD, py + TEXT_PAD);
+                    self.image(clip, mx, my, pw - 2.0 * TEXT_PAD, FILE_THUMB_H - 8.0, false)?;
+                } else if clip.kind == Kind::Files {
+                    self.folder(cx, py + TEXT_PAD);
+                } else {
+                    self.doc_glyph(cx, py + TEXT_PAD);
+                }
+                let text_y = top + text_top(clip);
+                self.text(clip.layout.as_ref(), text_x, text_y, TEXT);
                 self.text(clip.time_layout.as_ref(), text_x, time_y, MUTED);
             }
         }
@@ -469,8 +481,20 @@ impl Scene {
         }
     }
 
-    /// The image covering the content panel, with rounded corners.
-    fn image(&self, clip: &mut Clip, x: f32, y: f32, w: f32, h: f32) -> Result<()> {
+    /// A small document icon for clipboard data that has no picture.
+    fn doc_glyph(&self, cx: f32, y: f32) {
+        let (w, h) = (30.0, 38.0);
+        let x = cx - w / 2.0;
+        self.fill_rr(rrect(x, y, w, h, 4.0), DOC);
+        for k in 0..3 {
+            self.fill_rr(rrect(x + 6.0, y + 10.0 + k as f32 * 9.0, w - 12.0, 3.0, 1.5), PANEL);
+        }
+    }
+
+    /// The thumbnail inside the box (x, y, w, h), with rounded corners. `cover`
+    /// fills the whole box and crops the overflow; otherwise the whole picture is
+    /// shown, centred.
+    fn image(&self, clip: &mut Clip, x: f32, y: f32, w: f32, h: f32, cover: bool) -> Result<()> {
         if clip.thumb.is_none() {
             if let Some((tw, th, px)) = clip.thumb_px.as_ref() {
                 let props = D2D1_BITMAP_PROPERTIES1 {
@@ -496,13 +520,16 @@ impl Scene {
         let (Some(bmp), Some((tw, th, _))) = (clip.thumb.as_ref(), clip.thumb_px.as_ref()) else {
             return Ok(());
         };
-        let s = (w / *tw as f32).max(h / *th as f32);
+        let (fw, fh) = (w / *tw as f32, h / *th as f32);
+        let s = if cover { fw.max(fh) } else { fw.min(fh) };
         let (dw, dh) = (*tw as f32 * s, *th as f32 * s);
         let (dx, dy) = (x + (w - dw) / 2.0, y + (h - dh) / 2.0);
+        // Where the picture is painted: the whole box, or just where it lands.
+        let dest = if cover { rrect(x, y, w, h, PANEL_R) } else { rrect(dx, dy, dw, dh, 4.0) };
         unsafe {
             let brush = self.ctx.CreateBitmapBrush(bmp, None, None)?;
             brush.SetTransform(&Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: dx, M32: dy });
-            self.ctx.FillRoundedRectangle(&rrect(x, y, w, h, PANEL_R), &brush);
+            self.ctx.FillRoundedRectangle(&dest, &brush);
         }
         Ok(())
     }

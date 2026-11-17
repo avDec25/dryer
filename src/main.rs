@@ -11,6 +11,7 @@ mod origin;
 mod physics;
 mod render;
 mod ring;
+mod thumbs;
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 

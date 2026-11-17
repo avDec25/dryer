@@ -26,16 +26,20 @@ pub const TEXT_PAD: f32 = 10.0;
 pub const STRIP_H: f32 = 6.0;
 /// Space for the timestamp line.
 pub const TIME_H: f32 = 14.0;
-/// File icon above a file card's names.
+/// Icon above a file card's names, and the taller picture when there is a thumbnail.
 pub const FILE_GLYPH_H: f32 = 44.0;
+pub const FILE_THUMB_H: f32 = 80.0;
 pub const TEXT_W: f32 = CARD_W - 2.0 * (INSET + TEXT_PAD);
 const IMG_MIN_H: f32 = 60.0;
 const IMG_MAX_H: f32 = MAX_CARD_H - 2.0 * INSET;
 
 /// Top of the body text inside a card.
-pub fn text_top(kind: Kind) -> f32 {
-    match kind {
-        Kind::Files => INSET + TEXT_PAD + FILE_GLYPH_H,
+pub fn text_top(clip: &Clip) -> f32 {
+    match clip.kind {
+        Kind::Files | Kind::Other => {
+            let media = if clip.thumb_px.is_some() { FILE_THUMB_H } else { FILE_GLYPH_H };
+            INSET + TEXT_PAD + media
+        }
         _ => INSET + STRIP_H + TEXT_PAD,
     }
 }
@@ -121,8 +125,8 @@ impl Engine {
                     None => MIN_CARD_H,
                 };
             }
-            Kind::Text | Kind::Files => {
-                let top = text_top(clip.kind);
+            Kind::Text | Kind::Files | Kind::Other => {
+                let top = text_top(clip);
                 let max_h = MAX_CARD_H - top - FOOTER_H;
                 clip.layout = None;
                 clip.text_h = 0.0;

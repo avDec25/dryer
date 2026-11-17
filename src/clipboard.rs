@@ -1,4 +1,4 @@
-//! Clipboard capture and restore (Win32), plus DIB thumbnail decoding.
+//! Clipboard capture and restore (Win32).
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -7,8 +7,9 @@ use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextLayout;
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+    GetClipboardFormatNameW, GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -16,26 +17,39 @@ use windows::core::w;
 
 use crate::card::MIN_CARD_H;
 use crate::physics::Motion;
+use crate::thumbs::{self, Thumb};
 
 /// Largest total payload we will keep for one clip.
 const MAX_BYTES: usize = 8 * 1024 * 1024;
-/// Thumbnail box in pixels, aspect preserved.
-const THUMB_MAX_W: u32 = 260;
-const THUMB_MAX_H: u32 = 200;
 /// Characters of text kept for display (the full text stays in `formats`).
 const PREVIEW_CHARS: usize = 600;
 const MAX_FILE_NAMES: usize = 8;
+const MAX_FORMAT_NAMES: usize = 4;
 
 const CF_DIB: u32 = 8;
 const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
 const CF_DIBV5: u32 = 17;
 
+/// Registered clipboard formats that are only plumbing, not worth naming on a card.
+const NOISY_FORMATS: [&str; 8] = [
+    "Ole Private Data",
+    "DataObject",
+    "Preferred DropEffect",
+    "Shell IDList Array",
+    "InShellDragLoop",
+    "Clipboard Viewer Ignore",
+    "FileName",
+    "FileNameW",
+];
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Text,
     Image,
     Files,
+    /// Anything else: shapes, spreadsheet cells, app-specific data.
+    Other,
 }
 
 pub struct Clip {
@@ -43,10 +57,11 @@ pub struct Clip {
     /// Raw clipboard formats, restored verbatim on click.
     pub formats: Vec<(u32, Vec<u8>)>,
     pub hash: u64,
-    /// Text shown on the card: the start of a text clip, or the names of copied files.
+    /// Text shown on the card: the start of a text clip, the names of copied
+    /// files, or the kinds of data in an "other" clip.
     pub preview: String,
     /// Small BGRA thumbnail in system memory (for rebuilding GPU bitmaps).
-    pub thumb_px: Option<(u32, u32, Vec<u8>)>,
+    pub thumb_px: Option<Thumb>,
     /// GPU copy of the thumbnail, created lazily by the renderer.
     pub thumb: Option<ID2D1Bitmap1>,
     /// The whole card pre-rendered once, so frames only move and rotate it.
@@ -129,9 +144,17 @@ unsafe fn read_clip() -> Option<Clip> {
             return None;
         }
 
+        // Encoded images that browsers and editors put next to (or instead of) a bitmap.
+        let encoded = [
+            format_id(w!("PNG")),
+            format_id(w!("JFIF")),
+            format_id(w!("GIF")),
+        ];
         let html = format_id(w!("HTML Format"));
         let rtf = format_id(w!("Rich Text Format"));
-        let wanted = [CF_UNICODETEXT, CF_DIB, CF_DIBV5, CF_HDROP, html, rtf];
+        let wanted = [
+            CF_UNICODETEXT, CF_DIB, CF_DIBV5, CF_HDROP, html, rtf, encoded[0], encoded[1], encoded[2],
+        ];
 
         let mut formats: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut total = 0usize;
@@ -147,19 +170,15 @@ unsafe fn read_clip() -> Option<Clip> {
                 formats.push((fmt, bytes));
             }
         }
-        if formats.is_empty() {
-            return None;
-        }
 
-        let get = |fmt: u32| formats.iter().find(|(f, _)| *f == fmt).map(|(_, b)| b);
-        let (kind, thumb_px, preview) = if let Some(dib) = get(CF_DIB).or(get(CF_DIBV5)) {
-            (Kind::Image, thumb_from_dib(dib), String::new())
-        } else if let Some(drop) = get(CF_HDROP) {
-            (Kind::Files, None, file_names(drop))
-        } else if let Some(text) = get(CF_UNICODETEXT) {
-            (Kind::Text, None, text_preview(text))
-        } else {
-            return None;
+        // Text, an image or files: show it as such. Anything else is kept whole, so
+        // it can still be put back on the clipboard exactly as it was.
+        let (kind, thumb_px, preview, formats) = match classify(&formats, encoded) {
+            Some((kind, thumb, preview)) => (kind, thumb, preview, formats),
+            None => {
+                let (all, preview) = read_all_formats()?;
+                (Kind::Other, None, preview, all)
+            }
         };
 
         let mut hasher = DefaultHasher::new();
@@ -184,6 +203,89 @@ unsafe fn read_clip() -> Option<Clip> {
             motion: Motion::default(),
         })
     }
+}
+
+/// Decide what a clip is, and build its thumbnail and card text.
+fn classify(formats: &[(u32, Vec<u8>)], encoded: [u32; 3]) -> Option<(Kind, Option<Thumb>, String)> {
+    let get = |fmt: u32| formats.iter().find(|(f, _)| *f == fmt).map(|(_, b)| b);
+
+    // A bitmap on the clipboard (the V5 form can carry transparency).
+    let bitmap = get(CF_DIBV5)
+        .and_then(|d| thumbs::from_dib(d))
+        .or_else(|| get(CF_DIB).and_then(|d| thumbs::from_dib(d)));
+    if bitmap.is_some() {
+        return Some((Kind::Image, bitmap, String::new()));
+    }
+    // An encoded image (PNG, JPEG, GIF).
+    for fmt in encoded {
+        if let Some(t) = get(fmt).and_then(|d| thumbs::from_encoded(d)) {
+            return Some((Kind::Image, Some(t), String::new()));
+        }
+    }
+    if get(CF_DIB).is_some() || get(CF_DIBV5).is_some() {
+        // A bitmap we cannot decode: still an image, just without a picture.
+        return Some((Kind::Image, None, String::new()));
+    }
+
+    if let Some(drop) = get(CF_HDROP) {
+        let paths = file_paths(drop);
+        let names = paths
+            .iter()
+            .take(MAX_FILE_NAMES)
+            .map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let thumb = paths.first().and_then(|p| thumbs::from_file(p));
+        // A single image file reads as an image; anything else keeps its name.
+        let single_image = paths.len() == 1 && thumbs::is_image_path(&paths[0]) && thumb.is_some();
+        let kind = if single_image { Kind::Image } else { Kind::Files };
+        return Some((kind, thumb, if single_image { String::new() } else { names }));
+    }
+
+    get(CF_UNICODETEXT).map(|text| (Kind::Text, None, text_preview(text)))
+}
+
+/// Every in-memory format on the clipboard, plus a short label naming the kinds of data.
+unsafe fn read_all_formats() -> Option<(Vec<(u32, Vec<u8>)>, String)> {
+    unsafe {
+        let mut formats = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        let mut fmt = EnumClipboardFormats(0);
+        while fmt != 0 {
+            // Skip handle-based formats (bitmaps, palettes, metafiles, display copies).
+            let by_handle = matches!(fmt, 2 | 3 | 9 | 14 | 0x80..=0x8F | 0x200..=0x2FF);
+            if !by_handle {
+                if let Some(bytes) = read_format(fmt) {
+                    total += bytes.len();
+                    if total > MAX_BYTES {
+                        return None;
+                    }
+                    if fmt >= 0xC000 {
+                        if let Some(name) = format_name(fmt) {
+                            if !NOISY_FORMATS.contains(&name.as_str()) && !names.contains(&name) {
+                                names.push(name);
+                            }
+                        }
+                    }
+                    formats.push((fmt, bytes));
+                }
+            }
+            fmt = EnumClipboardFormats(fmt);
+        }
+        if formats.is_empty() {
+            return None;
+        }
+        names.truncate(MAX_FORMAT_NAMES);
+        let label = if names.is_empty() { "Clipboard data".to_string() } else { names.join("\n") };
+        Some((formats, label))
+    }
+}
+
+fn format_name(fmt: u32) -> Option<String> {
+    let mut buf = [0u16; 80];
+    let n = unsafe { GetClipboardFormatNameW(fmt, &mut buf) };
+    (n > 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
 }
 
 /// Local time of capture, shown at the bottom of the card.
@@ -211,15 +313,15 @@ fn text_preview(bytes: &[u8]) -> String {
         .to_string()
 }
 
-/// File names from a CF_HDROP (DROPFILES) payload, one per line.
-fn file_names(b: &[u8]) -> String {
+/// Full paths from a CF_HDROP (DROPFILES) payload.
+fn file_paths(b: &[u8]) -> Vec<String> {
     if b.len() < 20 {
-        return String::new();
+        return Vec::new();
     }
     let off = (u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize).min(b.len());
     let wide = u32::from_le_bytes([b[16], b[17], b[18], b[19]]) != 0;
     let body = &b[off..];
-    let paths: Vec<String> = if wide {
+    if wide {
         let units: Vec<u16> = body
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -234,65 +336,7 @@ fn file_names(b: &[u8]) -> String {
             .filter(|s| !s.is_empty())
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect()
-    };
-    paths
-        .iter()
-        .take(MAX_FILE_NAMES)
-        .map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p).to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Decode a 24/32 bpp uncompressed DIB into a small top-down BGRA thumbnail.
-fn thumb_from_dib(b: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    if b.len() < 40 {
-        return None;
     }
-    let bi_size = u32::from_le_bytes(b[0..4].try_into().ok()?) as usize;
-    let w = i32::from_le_bytes(b[4..8].try_into().ok()?);
-    let h_raw = i32::from_le_bytes(b[8..12].try_into().ok()?);
-    let bpp = u16::from_le_bytes(b[14..16].try_into().ok()?) as usize;
-    let comp = u32::from_le_bytes(b[16..20].try_into().ok()?);
-
-    if bi_size < 40 || w <= 0 || h_raw == 0 || !(bpp == 24 || bpp == 32) || !(comp == 0 || comp == 3) {
-        return None;
-    }
-    let w = w as usize;
-    let h = h_raw.unsigned_abs() as usize;
-    let bottom_up = h_raw > 0;
-
-    // BI_BITFIELDS with a 40-byte header stores three 4-byte masks after it.
-    let mut offset = bi_size;
-    if comp == 3 && bi_size == 40 {
-        offset += 12;
-    }
-    let bytes_pp = bpp / 8;
-    let stride = (w * bpp).div_ceil(32) * 4;
-    if b.len() < offset + stride * h {
-        return None;
-    }
-
-    let scale = (THUMB_MAX_W as f64 / w as f64)
-        .min(THUMB_MAX_H as f64 / h as f64)
-        .min(1.0);
-    let tw = ((w as f64 * scale).round() as usize).max(1);
-    let th = ((h as f64 * scale).round() as usize).max(1);
-
-    let mut px = vec![255u8; tw * th * 4];
-    for ty in 0..th {
-        let sy = ty * h / th;
-        let row = if bottom_up { h - 1 - sy } else { sy };
-        let base = offset + row * stride;
-        for tx in 0..tw {
-            let sx = tx * w / tw;
-            let s = base + sx * bytes_pp;
-            let d = (ty * tw + tx) * 4;
-            px[d] = b[s];
-            px[d + 1] = b[s + 1];
-            px[d + 2] = b[s + 2];
-        }
-    }
-    Some((tw as u32, th as u32, px))
 }
 
 /// Put the clip's formats on the clipboard. Returns the new sequence number so the
