@@ -1,5 +1,7 @@
 //! Dryer: a clothesline clipboard history for Windows 11.
-//! A borderless, click-through strip across the top of the primary monitor.
+//! A borderless strip across the top of the primary monitor. It retracts when idle,
+//! comes back when you copy something or rest the pointer on the top edge, and
+//! only the cards themselves ever catch the mouse.
 
 #![windows_subsystem = "windows"]
 
@@ -12,7 +14,7 @@ mod ring;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    COLORREF, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, ScreenToClient,
@@ -22,14 +24,14 @@ use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, GetClipboardSequenceNumber, RemoveClipboardFormatListener,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_SHIFT, MOD_WIN, RegisterHotKey, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    UnregisterHotKey,
+    GetAsyncKeyState, MOD_SHIFT, MOD_WIN, RegisterHotKey, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, UnregisterHotKey, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
@@ -39,7 +41,7 @@ use windows::core::w;
 
 use crate::card::CARD_W;
 use crate::clipboard::{Capture, Clip};
-use crate::physics::{Breeze, Rope};
+use crate::physics::{Breeze, Rope, Spring};
 use crate::render::{PEG_DROP, ROPE_Y};
 use crate::ring::Ring;
 
@@ -49,11 +51,22 @@ const WM_TRAY: u32 = WM_APP + 1;
 const TIMER_FRAME: usize = 1;
 const TIMER_RETRY: usize = 2;
 const TIMER_BREEZE: usize = 3;
+const TIMER_POLL: usize = 4;
 const FRAME_MS: u32 = 16;
 /// Frame interval for gentle motion (breeze) once nothing has happened for a while.
 const CALM_FRAME_MS: u32 = 33;
 const CALM_AFTER_S: f32 = 3.0;
 const FIRST_BREEZE_MS: u32 = 4_000;
+/// Pointer polling: quick while the line is down, slow while it is tucked away.
+const POLL_SHOWN_MS: u32 = 40;
+const POLL_HIDDEN_MS: u32 = 100;
+/// The line retracts after this long with nothing happening.
+const HIDE_AFTER_S: f32 = 6.0;
+/// The pointer must rest on the top edge for this many hidden polls to reveal the line.
+const REVEAL_POLLS: u32 = 3;
+/// Critically damped glide of the line up and down.
+const SLIDE_K: f32 = 70.0;
+const SLIDE_C: f32 = 16.5;
 const HOTKEY_ID: i32 = 1;
 const TRAY_ID: u32 = 1;
 const CMD_TOGGLE: usize = 1;
@@ -88,7 +101,24 @@ struct App {
     scene: Option<render::Scene>,
     rope: Rope,
     breeze: Breeze,
+    /// The window is shown (it is hidden entirely once the line has retracted).
     visible: bool,
+    /// The line should be down; false while it retracts or is tucked away.
+    want_shown: bool,
+    /// Vertical glide of the whole line in DIPs: 0 when down, negative when raised.
+    slide: Spring,
+    /// The window currently lets every click through to the windows below.
+    click_through: bool,
+    /// Consecutive hidden polls with the pointer on the top edge.
+    dwell: u32,
+    /// A mouse button was down at the previous poll.
+    mouse_down: bool,
+    /// When the line last retracted because of a click elsewhere. A tray click that
+    /// caused it must not bring the line straight back.
+    hidden_by_click: Instant,
+    /// When the line was last brought down.
+    shown_at: Instant,
+    polls: u32,
     hover: Option<usize>,
     tracking_mouse: bool,
     /// Sequence number produced by our own clipboard write; changes with it are ignored.
@@ -97,8 +127,11 @@ struct App {
     last_tick: Instant,
     timer_on: bool,
     frame_ms: u32,
-    /// Last copy, click, hover or show; after a quiet spell frames slow down.
+    /// Last copy, click, hover or reveal; after a quiet spell frames slow down,
+    /// and after a longer one the line retracts.
     last_event: Instant,
+    /// Top-left of the monitor in screen pixels.
+    origin: POINT,
     dpi: u32,
     px_w: i32,
     px_h: i32,
@@ -120,6 +153,14 @@ impl App {
             rope: Rope::new(),
             breeze: Breeze::new(seed),
             visible: false,
+            want_shown: false,
+            slide: Spring::default(),
+            click_through: true,
+            dwell: 0,
+            mouse_down: false,
+            hidden_by_click: Instant::now(),
+            shown_at: Instant::now(),
+            polls: 0,
             hover: None,
             tracking_mouse: false,
             own_seq: 0,
@@ -128,6 +169,7 @@ impl App {
             timer_on: false,
             frame_ms: FRAME_MS,
             last_event: Instant::now(),
+            origin: POINT::default(),
             dpi: 96,
             px_w: 0,
             px_h: 0,
@@ -145,8 +187,22 @@ impl App {
         (x as f32 / s, y as f32 / s)
     }
 
+    /// How far above its resting place the line sits when fully tucked away.
+    fn hidden_offset(&self) -> f32 {
+        BAND_DIP + 30.0
+    }
+
+    fn slide_target(&self) -> f32 {
+        if self.want_shown { 0.0 } else { -self.hidden_offset() }
+    }
+
+    /// The card under a point in window DIPs, if the line is down.
     fn hit(&self, x: f32, y: f32) -> Option<usize> {
-        render::hit(&self.ring, &self.rope, self.width_dip, x, y)
+        if !self.want_shown {
+            return None;
+        }
+        // The picture is shifted by `slide`, so move the point back into line space.
+        render::hit(&self.ring, &self.rope, self.width_dip, x, y - self.slide.x)
     }
 
     /// The pointer position in window DIPs.
@@ -154,9 +210,8 @@ impl App {
         let mut pt = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut pt);
-            let _ = ScreenToClient(self.hwnd, &mut pt);
         }
-        self.to_dip(pt.x, pt.y)
+        self.to_dip(pt.x - self.origin.x, pt.y - self.origin.y)
     }
 
     /// Current on-screen x of every card on the line, by content hash.
@@ -178,6 +233,7 @@ impl App {
             let _ = GetMonitorInfoW(mon, &mut info);
             let r: RECT = info.rcMonitor;
 
+            self.origin = POINT { x: r.left, y: r.top };
             self.dpi = GetDpiForSystem().max(96);
             let s = self.scale();
             self.px_w = r.right - r.left;
@@ -209,18 +265,142 @@ impl App {
         }
     }
 
-    fn set_visible(&mut self, visible: bool) {
-        self.visible = visible;
-        unsafe {
-            if visible {
+    /// Lower the line into view.
+    fn reveal(&mut self) {
+        self.want_shown = true;
+        self.shown_at = Instant::now();
+        self.mark_event();
+        if !self.visible {
+            self.visible = true;
+            self.slide.snap(-self.hidden_offset());
+            self.set_poll(POLL_SHOWN_MS);
+            unsafe {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-                self.last_tick = Instant::now();
-                self.last_event = Instant::now();
-                self.kick();
-            } else {
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
-                self.stop_timer();
             }
+        }
+        self.raise();
+        self.kick();
+    }
+
+    /// Put the line above every other window, including other always-on-top ones.
+    /// Other windows can claim the top spot later, so this is repeated while shown.
+    fn raise(&self) {
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Raise the line out of view; the window is hidden once it has gone.
+    fn hide(&mut self) {
+        self.want_shown = false;
+        self.set_hover(None, 0.0);
+        self.kick();
+    }
+
+    /// The line has fully retracted: hide the window and give back the GPU memory.
+    fn finish_hide(&mut self) {
+        self.visible = false;
+        self.hover = None;
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        self.stop_timer();
+        self.set_click_through(true);
+        self.set_poll(POLL_HIDDEN_MS);
+        self.drop_gpu();
+        unsafe {
+            // Trim the working set now that the swap chain and sprites are gone.
+            let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+        }
+    }
+
+    fn set_poll(&self, ms: u32) {
+        unsafe { SetTimer(Some(self.hwnd), TIMER_POLL, ms, None) };
+    }
+
+    /// Let clicks fall through to the windows below, or catch them (over a card).
+    /// This has to change the window style: answering HTTRANSPARENT to hit tests
+    /// only passes clicks on to windows of this same process.
+    fn set_click_through(&mut self, on: bool) {
+        if self.click_through == on {
+            return;
+        }
+        self.click_through = on;
+        unsafe {
+            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            let flag = WS_EX_TRANSPARENT.0 as isize;
+            let new = if on { ex | flag } else { ex & !flag };
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, new);
+        }
+    }
+
+    /// Watch the pointer: reveal on the top edge, pass clicks through except over a
+    /// card, and retract the line after a quiet spell.
+    fn on_poll(&mut self) {
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        let on_edge = pt.y <= self.origin.y + 1
+            && pt.x >= self.origin.x
+            && pt.x < self.origin.x + self.px_w;
+
+        // A mouse button going down anywhere. Tracked while hidden too, so a click
+        // that is still held when the line appears does not count as a new press.
+        let buttons = unsafe {
+            GetAsyncKeyState(VK_LBUTTON.0 as i32)
+                | GetAsyncKeyState(VK_RBUTTON.0 as i32)
+                | GetAsyncKeyState(VK_MBUTTON.0 as i32)
+        };
+        let down = buttons < 0;
+        let pressed = down && !self.mouse_down;
+        // A quick click can start and end between two slow (hidden) polls; the low
+        // bit says a button was pressed since the last check.
+        let clicked_since_last_poll = (buttons & 1) != 0;
+        self.mouse_down = down;
+
+        if !self.visible {
+            self.dwell = if on_edge { self.dwell + 1 } else { 0 };
+            // Resting on the top edge reveals the line; so does clicking there.
+            let clicked_on_edge = on_edge && (pressed || clicked_since_last_poll);
+            if self.dwell >= REVEAL_POLLS || clicked_on_edge {
+                self.dwell = 0;
+                self.reveal();
+            }
+            return;
+        }
+
+        let (x, y) = self.to_dip(pt.x - self.origin.x, pt.y - self.origin.y);
+        let over = self.hit(x, y).is_some();
+        self.set_click_through(!over);
+
+        // Clicking anywhere but on a card puts the line away. The grace period
+        // keeps the click that caused a reveal from undoing it.
+        if pressed && !over && self.want_shown && self.shown_at.elapsed().as_secs_f32() > 0.5 {
+            self.hidden_by_click = Instant::now();
+            self.hide();
+            return;
+        }
+
+        // Other windows can take the top spot; keep claiming it back.
+        self.polls = self.polls.wrapping_add(1);
+        if self.polls % 25 == 0 {
+            self.raise();
+        }
+
+        // Keep the line down while the pointer is on a card or on the top edge.
+        if over || on_edge {
+            self.last_event = Instant::now();
+        } else if self.want_shown && self.last_event.elapsed().as_secs_f32() > HIDE_AFTER_S {
+            self.hide();
         }
     }
 
@@ -267,6 +447,7 @@ impl App {
             }
         }
         if let Some(scene) = self.scene.as_ref() {
+            let _ = scene.set_offset(self.slide.x * self.scale());
             let drawn = scene.draw(&mut self.ring, &mut self.departing, &self.rope, self.width_dip);
             if drawn.is_err() {
                 // Device lost or target invalid: rebuild on the next frame.
@@ -282,6 +463,7 @@ impl App {
         self.last_tick = now;
         let w = self.width_dip;
         let n = self.ring.len();
+        let slide_target = self.slide_target();
 
         // Each card weighs the rope down where it hangs (not while still flying in).
         self.rope.clear_loads();
@@ -296,6 +478,7 @@ impl App {
 
         while dt > 0.0 {
             let h = dt.min(physics::SUBSTEP);
+            self.slide.step_to(slide_target, SLIDE_K, SLIDE_C, h);
             self.rope.step(h);
             self.breeze.step(h);
             for (i, c) in self.ring.iter_mut().enumerate() {
@@ -310,14 +493,22 @@ impl App {
             dt -= h;
         }
 
+        // The line has gone up out of view: hide the window.
+        if !self.want_shown && self.slide.x <= slide_target + 2.0 {
+            self.finish_hide();
+            return;
+        }
+
         // Departing clips are dropped once they have slid off the left edge.
         self.departing.retain(|c| c.motion.hx.x > -CARD_W);
 
-        let active = self.rope.active()
+        let active = self.slide.active(slide_target)
+            || self.rope.active()
             || self.breeze.active()
             || !self.departing.is_empty()
             || self.ring.iter_mut().any(|c| c.motion.active());
         if !active {
+            self.slide.snap(slide_target);
             for c in self.ring.iter_mut() {
                 c.motion.settle();
             }
@@ -354,6 +545,8 @@ impl App {
             Capture::Got(mut clip) => {
                 // Lay out the text and fix the card height once, up front.
                 let _ = self.engine.prepare(&mut clip);
+                // Bring the line down first so the new card is seen arriving.
+                self.reveal();
                 let before = self.positions();
                 let evicted = self.ring.insert(clip);
                 let from = self.cursor_dip();
@@ -429,7 +622,7 @@ impl App {
         self.kick();
     }
 
-    /// Something happened: animate at full frame rate for a while.
+    /// Something happened: animate at full frame rate for a while, and keep the line down.
     fn mark_event(&mut self) {
         self.last_event = Instant::now();
         if self.timer_on && self.frame_ms != FRAME_MS {
@@ -439,7 +632,7 @@ impl App {
     }
 
     fn on_breeze(&mut self) {
-        if self.visible && self.ring.len() > 0 {
+        if self.visible && self.want_shown && self.ring.len() > 0 {
             self.breeze.start();
             self.kick();
         }
@@ -448,8 +641,12 @@ impl App {
     }
 
     fn toggle(&mut self) {
-        let next = !self.visible;
-        self.set_visible(next);
+        if self.want_shown {
+            self.hide();
+        } else if self.hidden_by_click.elapsed().as_millis() > 400 {
+            // (A tray click that just put the line away must not reopen it.)
+            self.reveal();
+        }
     }
 
     fn on_mouse_move(&mut self, lp: LPARAM) {
@@ -568,6 +765,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     app.try_capture();
                 }
                 TIMER_BREEZE => app.on_breeze(),
+                TIMER_POLL => app.on_poll(),
                 _ => {}
             },
             WM_HOTKEY => {
@@ -628,8 +826,14 @@ fn main() -> windows::core::Result<()> {
         };
         RegisterClassExW(&class);
 
+        // Starts click-through; the window only catches the mouse over a card.
         let hwnd = CreateWindowExW(
-            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_NOREDIRECTIONBITMAP
+                | WS_EX_LAYERED
+                | WS_EX_TOPMOST
+                | WS_EX_TOOLWINDOW
+                | WS_EX_NOACTIVATE
+                | WS_EX_TRANSPARENT,
             w!("DryerOverlay"),
             w!("Dryer"),
             WS_POPUP,
@@ -643,6 +847,10 @@ fn main() -> windows::core::Result<()> {
             None,
         )?;
 
+        // WS_EX_TRANSPARENT only makes a window skippable for mouse hit testing when it
+        // is also layered. Full opacity: the picture itself comes from DirectComposition.
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+
         let engine = card::Engine::new().expect("DirectWrite is unavailable");
         let app = Box::into_raw(Box::new(App::new(hwnd, engine)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
@@ -652,8 +860,8 @@ fn main() -> windows::core::Result<()> {
         let _ = AddClipboardFormatListener(hwnd);
         let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_WIN | MOD_SHIFT, 'C' as u32);
         app.reposition();
-        // The rope starts taut and drops into its sag when the line appears.
-        app.set_visible(true);
+        // The rope starts taut and drops into its sag as the line glides down.
+        app.reveal();
         SetTimer(Some(hwnd), TIMER_BREEZE, FIRST_BREEZE_MS, None);
 
         let mut msg = MSG::default();

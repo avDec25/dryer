@@ -1,6 +1,7 @@
 //! Direct2D drawing into a DirectComposition-bound swap chain.
 //! All geometry is in device-independent pixels (DIPs); the context DPI maps them to pixels.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 
 use windows::Win32::Foundation::{HMODULE, HWND};
@@ -126,6 +127,8 @@ pub struct Scene {
     /// The swap chain's back buffer as a Direct2D target.
     target: ID2D1Bitmap1,
     dpi: f32,
+    /// Vertical offset of the whole line in pixels (negative slides it up out of view).
+    offset: Cell<f32>,
     brush: ID2D1SolidColorBrush,
     // Held so the composition tree and devices stay alive.
     _dcomp: IDCompositionDevice,
@@ -203,6 +206,7 @@ impl Scene {
                 swap,
                 target,
                 dpi: dpi as f32,
+                offset: Cell::new(0.0),
                 brush,
                 _dcomp: dcomp,
                 _target: comp_target,
@@ -210,6 +214,19 @@ impl Scene {
                 _d2d: d2d,
                 _d3d: d3d,
             })
+        }
+    }
+
+    /// Slide the whole line vertically by `dy` pixels. The compositor moves the
+    /// finished picture, so nothing is redrawn.
+    pub fn set_offset(&self, dy: f32) -> Result<()> {
+        if (self.offset.get() - dy).abs() < 0.01 {
+            return Ok(());
+        }
+        self.offset.set(dy);
+        unsafe {
+            self._visual.SetOffsetY2(dy)?;
+            self._dcomp.Commit()
         }
     }
 
