@@ -19,6 +19,7 @@ Built with Rust, Win32, Direct2D and DirectComposition (plus DirectWrite for tex
 | Restore a clip | Click its card |
 | Show the line | Move the pointer to the very top edge of the screen and rest there or click, copy something, press `Win+Shift+C`, or left-click the tray icon |
 | Hide the line | Click anywhere outside the cards; it also retracts by itself after about 6 seconds with nothing happening; or press `Win+Shift+C` / left-click the tray icon |
+| Start Dryer when you log in | Right-click the tray icon, then Start with Windows (checked means on) |
 | Turn the copy beep on or off | Right-click the tray icon, then Copy sound (checked means on) |
 | Erase all saved clips | Right-click the tray icon, then Clear history |
 | Quit | Right-click the tray icon, then Quit |
@@ -68,10 +69,6 @@ The release binary is `target\release\dryer.exe`. It is a single file with no in
 cargo test
 ```
 
-### Start with Windows
-
-Put a shortcut to `dryer.exe` in your Startup folder (`Win+R`, then `shell:startup`).
-
 ## Tuning the animation
 
 The feel of the motion is set by a few constants at the top of `src\physics.rs`: rope stiffness and sag, swing strength and damping, slide speed, and gust strength and timing. Card sizes and spacing are in `src\card.rs`.
@@ -85,6 +82,7 @@ The feel of the motion is set by a few constants at the top of `src\physics.rs`:
 | `src\ring.rs` | The fixed 10-slot history |
 | `src\sound.rs` | The copy beep (`copy-beep.mp3`, embedded in the exe) |
 | `src\store.rs` | Saving the history to disk (encrypted) and loading it at startup |
+| `src\autostart.rs` | Start at login (the per-user `Run` registry key) |
 | `src\card.rs` | Card sizes, layout along the line, text layout |
 | `src\render.rs` | Direct2D drawing and DirectComposition setup |
 | `src\physics.rs` | Rope, pendulum, slide and breeze physics |

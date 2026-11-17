@@ -5,6 +5,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod autostart;
 mod card;
 mod clipboard;
 mod origin;
@@ -81,6 +82,7 @@ const CMD_TOGGLE: usize = 1;
 const CMD_QUIT: usize = 2;
 const CMD_CLEAR: usize = 3;
 const CMD_SOUND: usize = 4;
+const CMD_AUTOSTART: usize = 5;
 const RETRY_MS: u32 = 15;
 const MAX_RETRIES: u32 = 5;
 /// Downward kick on the rope where a clicked card is unclipped.
@@ -855,6 +857,9 @@ impl App {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE, w!("Show / Hide"));
+            let autostart_flags =
+                if autostart::is_enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, autostart_flags, CMD_AUTOSTART, w!("Start with Windows"));
             let sound_flags = if self.sound.enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };
             let _ = AppendMenuW(menu, sound_flags, CMD_SOUND, w!("Copy sound"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_CLEAR, w!("Clear history"));
@@ -922,6 +927,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             },
             WM_COMMAND => match wp.0 & 0xFFFF {
                 CMD_TOGGLE => app.toggle(),
+                CMD_AUTOSTART => {
+                    autostart::set_enabled(!autostart::is_enabled());
+                }
                 CMD_CLEAR => app.clear_history(),
                 CMD_SOUND => {
                     let on = !app.sound.enabled();
@@ -1013,6 +1021,7 @@ fn main() -> windows::core::Result<()> {
 
         let app = &mut *app;
         app.load_history();
+        autostart::refresh();
         app.add_tray();
         let _ = AddClipboardFormatListener(hwnd);
         let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_WIN | MOD_SHIFT, 'C' as u32);
