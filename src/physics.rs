@@ -178,6 +178,8 @@ const SLIDE_W: f32 = 12.0;
 const RISE_LEAD_W: f32 = 8.5;
 /// A new card starts slightly larger and shrinks onto the line.
 const SCALE_W: f32 = 9.0;
+/// The newest-card outline fades over about half a second.
+const GLOW_W: f32 = 8.0;
 /// Gravity for the pendulum (DIP/s²): with a card's hanging length this sets its
 /// swing period, so taller cards swing more slowly.
 const SWING_G: f32 = 3000.0;
@@ -227,6 +229,9 @@ pub struct Motion {
     pub grow: Spring,
     /// Pendulum angle about the clip (radians, clockwise positive) and its speed.
     pub swing: Spring,
+    /// How strongly the "newest card" outline shows, 0 to 1. It fades in and out.
+    pub glow: Spring,
+    pub glow_target: f32,
 }
 
 impl Motion {
@@ -270,6 +275,8 @@ impl Motion {
         self.hy.step_to(self.lead_y.x, w2 * w2, 2.0 * w2, dt);
         let ws = SCALE_W;
         self.grow.step_to(0.0, ws * ws, 2.0 * ws, dt);
+        let wg = GLOW_W;
+        self.glow.step_to(self.glow_target, wg * wg, 2.0 * wg, dt);
 
         // Pendulum about the clip. Clockwise (positive) moves the bottom left, so the
         // card lags behind a clip accelerating right, and is pushed left by wind
@@ -292,6 +299,7 @@ impl Motion {
             || self.lead_y.active(0.0)
             || self.hy.active(0.0)
             || self.grow.active(0.0)
+            || self.glow.active(self.glow_target)
             || self.swing.active(0.0)
     }
 
@@ -301,6 +309,7 @@ impl Motion {
         self.lead_y.snap(0.0);
         self.hy.snap(0.0);
         self.grow.snap(0.0);
+        self.glow.snap(self.glow_target);
         self.swing = Spring::default();
     }
 }

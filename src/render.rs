@@ -32,6 +32,11 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
 };
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COMPOSITE_MODE_SOURCE_OVER;
+use windows::Win32::Graphics::Direct2D::{
+    CLSID_D2D1Shadow, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_PROPERTY_TYPE_UNKNOWN,
+    D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, D2D1_SHADOW_PROP_COLOR,
+};
 use windows::core::{Interface, Result};
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -45,15 +50,20 @@ pub const ROPE_Y: f32 = 12.0;
 /// From the rope (where the clip bites) down to the top of the card.
 pub const PEG_DROP: f32 = 8.0;
 /// Margin around a card in its sprite, so the shadow fits.
-const SPRITE_PAD: f32 = 12.0;
+const SPRITE_PAD: f32 = 46.0;
+/// The layers of a card's shadow, widest first: (blur radius, opacity, drop), in DIPs.
+/// A wide soft ambient shadow, a medium one under the card, and a tight contact
+/// shadow along its edge, as a photo editor would build a realistic drop shadow.
+const SHADOW_LAYERS: [(f32, f32, f32); 3] = [(11.0, 0.40, 10.0), (4.5, 0.32, 3.5), (1.3, 0.38, 1.0)];
 const FRAME_R: f32 = 13.0;
 const PANEL_R: f32 = 9.0;
 
 const FRAME: D2D1_COLOR_F = rgba(0.17, 0.17, 0.20, 0.82);
 const FRAME_EDGE: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.22);
 const PANEL: D2D1_COLOR_F = rgba(0.10, 0.10, 0.12, 0.97);
-const SHADOW_NEAR: D2D1_COLOR_F = rgba(0.0, 0.0, 0.0, 0.22);
-const SHADOW_FAR: D2D1_COLOR_F = rgba(0.0, 0.0, 0.0, 0.10);
+/// The newest card is outlined in this accent colour, with a faint glow around it.
+const NEWEST_EDGE: D2D1_COLOR_F = rgba(0.38, 0.68, 1.0, 1.0);
+const NEWEST_GLOW: D2D1_COLOR_F = rgba(0.38, 0.68, 1.0, 0.24);
 const NOTE_STRIP: D2D1_COLOR_F = rgba(0.98, 0.80, 0.22, 1.0);
 const TEXT: D2D1_COLOR_F = rgba(0.93, 0.93, 0.95, 1.0);
 const MUTED: D2D1_COLOR_F = rgba(0.60, 0.60, 0.66, 1.0);
@@ -336,6 +346,18 @@ impl Scene {
             }
         }
         unsafe { self.ctx.SetTransform(&m) };
+
+        // The newest card is outlined. This is drawn live, not baked into the sprite,
+        // because a card stops being the newest as soon as another one arrives; the
+        // outline fades in and out with `glow`.
+        let glow = clip.motion.glow.x.clamp(0.0, 1.0);
+        if glow > 0.01 {
+            let h = clip.card_h;
+            let faded = |c: D2D1_COLOR_F| rgba(c.r, c.g, c.b, c.a * glow);
+            self.stroke_rr(rrect(left - 1.5, top - 1.5, CARD_W + 3.0, h + 3.0, FRAME_R + 1.5), 5.0, faded(NEWEST_GLOW));
+            self.stroke_rr(rrect(left + 0.5, top + 0.5, CARD_W - 1.0, h - 1.0, FRAME_R - 0.5), 2.0, faded(NEWEST_EDGE));
+        }
+
         self.clothespin(cx, hy);
         Ok(())
     }
@@ -360,12 +382,52 @@ impl Scene {
         };
         let size = D2D_SIZE_U { width: (w * s).ceil() as u32, height: (h * s).ceil() as u32 };
         unsafe {
+            let clear = rgba(0.0, 0.0, 0.0, 0.0);
+
+            // 1. The card's silhouette, which the shadows are blurred from.
+            let mask = self.ctx.CreateBitmap(size, None, 0, &props)?;
+            self.ctx.SetTarget(&mask);
+            self.ctx.BeginDraw();
+            self.ctx.Clear(Some(&clear as *const D2D1_COLOR_F));
+            self.ctx.SetTransform(&Matrix3x2::identity());
+            self.fill_rr(
+                rrect(SPRITE_PAD, SPRITE_PAD, CARD_W, clip.card_h, FRAME_R),
+                rgba(1.0, 1.0, 1.0, 1.0),
+            );
+            self.ctx.EndDraw(None, None)?;
+
+            // 2. Real Gaussian blurs of it: (blur radius, opacity, how far it drops).
+            let mut shadows = Vec::new();
+            for (sigma, alpha, drop) in SHADOW_LAYERS {
+                let effect = self.ctx.CreateEffect(&CLSID_D2D1Shadow)?;
+                effect.SetInput(0, &mask, true);
+                effect.SetValue(
+                    D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION.0 as u32,
+                    D2D1_PROPERTY_TYPE_UNKNOWN,
+                    &sigma.to_ne_bytes(),
+                )?;
+                let colour: Vec<u8> = [0.0f32, 0.0, 0.0, alpha].iter().flat_map(|c| c.to_ne_bytes()).collect();
+                effect.SetValue(D2D1_SHADOW_PROP_COLOR.0 as u32, D2D1_PROPERTY_TYPE_UNKNOWN, &colour)?;
+                shadows.push((effect, drop));
+            }
+
+            // 3. The sprite: shadows underneath, then the card itself.
             let sprite = self.ctx.CreateBitmap(size, None, 0, &props)?;
             self.ctx.SetTarget(&sprite);
             self.ctx.BeginDraw();
-            let clear = rgba(0.0, 0.0, 0.0, 0.0);
             self.ctx.Clear(Some(&clear as *const D2D1_COLOR_F));
             self.ctx.SetTransform(&Matrix3x2::identity());
+            for (effect, drop) in &shadows {
+                let image = effect.GetOutput()?;
+                let offset = Vector2 { X: 0.0, Y: *drop };
+                let _ = self.ctx.DrawImage(
+                    &image,
+                    Some(&offset as *const Vector2),
+                    None,
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                );
+            }
             let drawn = self.draw_body(clip, SPRITE_PAD, SPRITE_PAD);
             self.ctx.EndDraw(None, None)?;
             drawn?;
@@ -380,10 +442,6 @@ impl Scene {
     fn draw_body(&self, clip: &mut Clip, left: f32, top: f32) -> Result<()> {
         let h = clip.card_h;
         let cx = left + CARD_W / 2.0;
-
-        // Soft shadow: two offset layers.
-        self.fill_rr(rrect(left - 1.0, top + 3.0, CARD_W + 2.0, h + 2.0, FRAME_R + 1.0), SHADOW_NEAR);
-        self.fill_rr(rrect(left + 2.0, top + 8.0, CARD_W - 4.0, h + 2.0, FRAME_R), SHADOW_FAR);
 
         // Glass frame.
         self.fill_rr(rrect(left, top, CARD_W, h, FRAME_R), FRAME);

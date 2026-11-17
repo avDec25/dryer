@@ -616,6 +616,11 @@ impl App {
             let _ = self.engine.prepare(&mut clip);
             self.ring.insert(clip);
         }
+        // The newest card carries its outline from the start, with no fade-in.
+        if let Some(c) = self.ring.get_mut(0) {
+            c.motion.glow_target = 1.0;
+            c.motion.glow.snap(1.0);
+        }
     }
 
     /// The line changed: save it shortly, once changes stop coming.
@@ -732,7 +737,12 @@ impl App {
         if needs_tall {
             self.set_tall(true);
         }
+        // Only the newest card is outlined; the outline fades over to a new arrival.
+        for (i, c) in self.ring.iter_mut().enumerate() {
+            c.motion.glow_target = if i == 0 { 1.0 } else { 0.0 };
+        }
         if let Some(mut c) = evicted {
+            c.motion.glow_target = 0.0;
             let old_x = before
                 .iter()
                 .find(|(h, _)| *h == c.hash)
