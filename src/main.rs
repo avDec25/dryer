@@ -11,6 +11,7 @@ mod origin;
 mod physics;
 mod render;
 mod ring;
+mod sound;
 mod store;
 mod thumbs;
 
@@ -79,6 +80,7 @@ const TRAY_ID: u32 = 1;
 const CMD_TOGGLE: usize = 1;
 const CMD_QUIT: usize = 2;
 const CMD_CLEAR: usize = 3;
+const CMD_SOUND: usize = 4;
 const RETRY_MS: u32 = 15;
 const MAX_RETRIES: u32 = 5;
 /// Downward kick on the rope where a clicked card is unclipped.
@@ -110,6 +112,8 @@ struct App {
     store: Option<store::Store>,
     /// The line has changed since it was last saved.
     dirty: bool,
+    /// The beep played on every copy.
+    sound: sound::Sound,
     /// Clips pushed out of the ring, sliding off the left edge (absolute x in `hx`).
     departing: Vec<Clip>,
     scene: Option<render::Scene>,
@@ -170,6 +174,7 @@ impl App {
             locator: origin::Locator::new(),
             store: store::Store::open(),
             dirty: false,
+            sound: sound::Sound::new(),
             departing: Vec::new(),
             scene: None,
             rope: Rope::new(),
@@ -659,6 +664,8 @@ impl App {
             }
             Capture::Skip => {}
             Capture::Got(mut clip) => {
+                // First thing: the beep should come with the copy, not after the animation.
+                self.sound.play();
                 // Lay out the text and fix the card height once, up front.
                 let _ = self.engine.prepare(&mut clip);
                 // Bring the line down first so the new card is seen arriving.
@@ -848,6 +855,8 @@ impl App {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE, w!("Show / Hide"));
+            let sound_flags = if self.sound.enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, sound_flags, CMD_SOUND, w!("Copy sound"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_CLEAR, w!("Clear history"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit"));
             let mut pt = POINT::default();
@@ -914,6 +923,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_COMMAND => match wp.0 & 0xFFFF {
                 CMD_TOGGLE => app.toggle(),
                 CMD_CLEAR => app.clear_history(),
+                CMD_SOUND => {
+                    let on = !app.sound.enabled();
+                    app.sound.set_enabled(on);
+                    // Let the user hear what they just switched on.
+                    app.sound.play();
+                }
                 CMD_QUIT => {
                     let _ = DestroyWindow(hwnd);
                 }

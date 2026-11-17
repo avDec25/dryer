@@ -7,6 +7,7 @@ Dryer has no window. A thin rope hangs across the top of your primary monitor, a
 - Text, images and copied files each get a card. Card width is fixed; height fits the content, between a minimum and a maximum.
 - The rope sags under the cards, new clips fly up from the pointer, and cards swing from their pegs.
 - Clips from password managers that ask not to be recorded are skipped.
+- A short beep plays whenever a copy is added to the line (the sound is built into the exe). Switch it off with **Copy sound** in the tray menu; the choice is remembered.
 - The line is remembered across restarts. Clips are saved in `%LOCALAPPDATA%\Dryer\history`, each in its own file encrypted with Windows DPAPI, so only your account on this PC can read them. Use **Clear history** in the tray menu to erase them.
 
 Built with Rust, Win32, Direct2D and DirectComposition (plus DirectWrite for text).
@@ -18,6 +19,7 @@ Built with Rust, Win32, Direct2D and DirectComposition (plus DirectWrite for tex
 | Restore a clip | Click its card |
 | Show the line | Move the pointer to the very top edge of the screen and rest there or click, copy something, press `Win+Shift+C`, or left-click the tray icon |
 | Hide the line | Click anywhere outside the cards; it also retracts by itself after about 6 seconds with nothing happening; or press `Win+Shift+C` / left-click the tray icon |
+| Turn the copy beep on or off | Right-click the tray icon, then Copy sound (checked means on) |
 | Erase all saved clips | Right-click the tray icon, then Clear history |
 | Quit | Right-click the tray icon, then Quit |
 
@@ -81,6 +83,7 @@ The feel of the motion is set by a few constants at the top of `src\physics.rs`:
 | `src\main.rs` | Window, message loop, tray, hotkey, animation timer |
 | `src\clipboard.rs` | Capturing and restoring clipboard formats |
 | `src\ring.rs` | The fixed 10-slot history |
+| `src\sound.rs` | The copy beep (`copy-beep.mp3`, embedded in the exe) |
 | `src\store.rs` | Saving the history to disk (encrypted) and loading it at startup |
 | `src\card.rs` | Card sizes, layout along the line, text layout |
 | `src\render.rs` | Direct2D drawing and DirectComposition setup |
