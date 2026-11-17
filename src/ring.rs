@@ -95,6 +95,7 @@ mod tests {
             thumb: None,
             sprite: None,
             layout: None,
+            minutes: 0,
             time_text: String::new(),
             time_layout: None,
             text_h: 0.0,

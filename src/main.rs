@@ -11,6 +11,7 @@ mod origin;
 mod physics;
 mod render;
 mod ring;
+mod store;
 mod thumbs;
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -54,6 +55,10 @@ const TIMER_FRAME: usize = 1;
 const TIMER_RETRY: usize = 2;
 const TIMER_BREEZE: usize = 3;
 const TIMER_POLL: usize = 4;
+const TIMER_SAVE: usize = 5;
+/// The history is written this long after the last change, so a burst of copies
+/// is saved once.
+const SAVE_DELAY_MS: u32 = 2_000;
 const FRAME_MS: u32 = 16;
 /// Frame interval for gentle motion (breeze) once nothing has happened for a while.
 const CALM_FRAME_MS: u32 = 33;
@@ -73,6 +78,7 @@ const HOTKEY_ID: i32 = 1;
 const TRAY_ID: u32 = 1;
 const CMD_TOGGLE: usize = 1;
 const CMD_QUIT: usize = 2;
+const CMD_CLEAR: usize = 3;
 const RETRY_MS: u32 = 15;
 const MAX_RETRIES: u32 = 5;
 /// Downward kick on the rope where a clicked card is unclipped.
@@ -100,6 +106,10 @@ struct App {
     engine: card::Engine,
     /// Finds where on screen the copied content was.
     locator: origin::Locator,
+    /// Where the history is kept on disk (None if there is no such place).
+    store: Option<store::Store>,
+    /// The line has changed since it was last saved.
+    dirty: bool,
     /// Clips pushed out of the ring, sliding off the left edge (absolute x in `hx`).
     departing: Vec<Clip>,
     scene: Option<render::Scene>,
@@ -158,6 +168,8 @@ impl App {
             ring: Ring::new(),
             engine,
             locator: origin::Locator::new(),
+            store: store::Store::open(),
+            dirty: false,
             departing: Vec::new(),
             scene: None,
             rope: Rope::new(),
@@ -587,6 +599,47 @@ impl App {
         }
     }
 
+    /// Bring back the clips saved by an earlier run. They appear in place, without
+    /// the fly-in.
+    fn load_history(&mut self) {
+        let Some(store) = self.store.as_ref() else { return };
+        let mut saved = store.load(); // newest first
+        // Insert the oldest first, so the newest ends up in slot 0.
+        while let Some(mut clip) = saved.pop() {
+            let _ = self.engine.prepare(&mut clip);
+            self.ring.insert(clip);
+        }
+    }
+
+    /// The line changed: save it shortly, once changes stop coming.
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        unsafe { SetTimer(Some(self.hwnd), TIMER_SAVE, SAVE_DELAY_MS, None) };
+    }
+
+    /// Write the history to disk if it changed since the last write.
+    fn persist(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        let Some(store) = self.store.as_ref() else { return };
+        let clips: Vec<&Clip> = (0..self.ring.len()).filter_map(|i| self.ring.get(i)).collect();
+        store.save(&clips);
+    }
+
+    /// Forget every clip, on the line and on disk.
+    fn clear_history(&mut self) {
+        self.ring = Ring::new();
+        self.departing.clear();
+        self.hover = None;
+        self.dirty = false;
+        if let Some(store) = self.store.as_ref() {
+            store.clear();
+        }
+        self.kick();
+    }
+
     fn on_clipboard_update(&mut self) {
         let seq = unsafe { GetClipboardSequenceNumber() };
         if seq != 0 && seq == self.own_seq {
@@ -614,6 +667,7 @@ impl App {
                 let evicted = self.ring.insert(clip);
                 let from = self.copy_origin();
                 self.reflow(&before, evicted, Some(from));
+                self.mark_dirty();
                 self.kick();
             }
         }
@@ -634,6 +688,7 @@ impl App {
         }
         self.ring.move_to_front(idx);
         self.reflow(&before, None, None);
+        self.mark_dirty();
         self.kick();
     }
 
@@ -793,6 +848,7 @@ impl App {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE, w!("Show / Hide"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_CLEAR, w!("Clear history"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit"));
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -839,6 +895,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 TIMER_BREEZE => app.on_breeze(),
                 TIMER_POLL => app.on_poll(),
+                TIMER_SAVE => {
+                    let _ = KillTimer(Some(hwnd), TIMER_SAVE);
+                    app.persist();
+                }
                 _ => {}
             },
             WM_HOTKEY => {
@@ -853,6 +913,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             },
             WM_COMMAND => match wp.0 & 0xFFFF {
                 CMD_TOGGLE => app.toggle(),
+                CMD_CLEAR => app.clear_history(),
                 CMD_QUIT => {
                     let _ = DestroyWindow(hwnd);
                 }
@@ -863,7 +924,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 app.render();
             }
             WM_DISPLAYCHANGE | WM_DPICHANGED => app.reposition(),
+            // Windows is signing out or shutting down: save before the process is ended.
+            WM_ENDSESSION => {
+                if wp.0 != 0 {
+                    app.persist();
+                }
+            }
             WM_DESTROY => {
+                app.persist();
                 let _ = RemoveClipboardFormatListener(hwnd);
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
                 app.remove_tray();
@@ -929,6 +997,7 @@ fn main() -> windows::core::Result<()> {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
 
         let app = &mut *app;
+        app.load_history();
         app.add_tray();
         let _ = AddClipboardFormatListener(hwnd);
         let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_WIN | MOD_SHIFT, 'C' as u32);

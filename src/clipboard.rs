@@ -68,7 +68,9 @@ pub struct Clip {
     pub sprite: Option<ID2D1Bitmap1>,
     /// DirectWrite layout of `preview`, built once at capture.
     pub layout: Option<IDWriteTextLayout>,
-    /// When the clip was copied, e.g. "Today, 22:52".
+    /// When the clip was copied: local wall-clock minutes since 1970-01-01.
+    pub minutes: u32,
+    /// `minutes` as shown on the card, e.g. "Today, 22:52".
     pub time_text: String,
     pub time_layout: Option<IDWriteTextLayout>,
     /// Laid-out text height in DIPs.
@@ -181,22 +183,20 @@ unsafe fn read_clip() -> Option<Clip> {
             }
         };
 
-        let mut hasher = DefaultHasher::new();
-        for (fmt, bytes) in &formats {
-            fmt.hash(&mut hasher);
-            bytes.hash(&mut hasher);
-        }
+        let hash = hash_formats(&formats);
+        let minutes = local_minutes();
 
         Some(Clip {
             kind,
             formats,
-            hash: hasher.finish(),
+            hash,
             preview,
             thumb_px,
             thumb: None,
             sprite: None,
             layout: None,
-            time_text: now_text(),
+            minutes,
+            time_text: time_label(minutes, minutes),
             time_layout: None,
             text_h: 0.0,
             card_h: MIN_CARD_H,
@@ -282,16 +282,98 @@ unsafe fn read_all_formats() -> Option<(Vec<(u32, Vec<u8>)>, String)> {
     }
 }
 
-fn format_name(fmt: u32) -> Option<String> {
+/// The name of a registered clipboard format (id 0xC000 and up).
+pub fn format_name(fmt: u32) -> Option<String> {
     let mut buf = [0u16; 80];
     let n = unsafe { GetClipboardFormatNameW(fmt, &mut buf) };
     (n > 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
 }
 
-/// Local time of capture, shown at the bottom of the card.
-fn now_text() -> String {
+/// Content hash used to spot a clip that is already on the line. Registered
+/// format ids change from one boot to the next, so those are hashed by name:
+/// the same content must hash the same after a restart.
+pub fn hash_formats(formats: &[(u32, Vec<u8>)]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for (fmt, bytes) in formats {
+        match (*fmt >= 0xC000).then(|| format_name(*fmt)).flatten() {
+            Some(name) => name.hash(&mut hasher),
+            None => fmt.hash(&mut hasher),
+        }
+        bytes.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Days since 1970-01-01 for a calendar date (proleptic Gregorian).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The calendar date (year, month 1..=12, day) for days since 1970-01-01.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + (m <= 2) as i64, m, d)
+}
+
+/// The current local time as minutes since 1970-01-01 (a calendar position, not UTC).
+pub fn local_minutes() -> u32 {
     let t = unsafe { GetLocalTime() };
-    format!("Today, {:02}:{:02}", t.wHour, t.wMinute)
+    let days = days_from_civil(t.wYear as i64, t.wMonth as i64, t.wDay as i64);
+    (days * 1440 + t.wHour as i64 * 60 + t.wMinute as i64) as u32
+}
+
+/// How a capture time reads on a card: "Today, 22:52", "Yesterday, 09:05" or "3 Nov, 14:20".
+pub fn time_label(minutes: u32, now: u32) -> String {
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (day, minute_of_day) = (minutes / 1440, minutes % 1440);
+    let clock = format!("{:02}:{:02}", minute_of_day / 60, minute_of_day % 60);
+    match (now / 1440).saturating_sub(day) {
+        0 => format!("Today, {clock}"),
+        1 => format!("Yesterday, {clock}"),
+        _ => {
+            let (_, m, d) = civil_from_days(day as i64);
+            format!("{d} {}, {clock}", MONTHS[(m - 1) as usize])
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calendar_conversion_round_trips() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        for days in [0, 59, 60, 365, 11_016, 11_017, 20_000, 25_000] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "day {days}");
+        }
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn time_labels() {
+        let day = |d: i64, h: u32, m: u32| (d * 1440) as u32 + h * 60 + m;
+        let nov17 = days_from_civil(2026, 11, 17);
+        let now = day(nov17, 23, 15);
+        assert_eq!(time_label(day(nov17, 9, 5), now), "Today, 09:05");
+        assert_eq!(time_label(day(nov17 - 1, 22, 40), now), "Yesterday, 22:40");
+        assert_eq!(time_label(day(nov17 - 14, 14, 20), now), "3 Nov, 14:20");
+    }
 }
 
 /// The first part of a UTF-16 text payload, with line endings normalised.
