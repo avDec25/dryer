@@ -110,7 +110,7 @@ pub fn card_load(card_h: f32) -> f32 {
 
 const GUST_LEN: f32 = 4.0;
 /// Peak sideways push of a gust on a card (DIP/s²).
-const BREEZE_ACCEL: f32 = 220.0;
+const BREEZE_ACCEL: f32 = 140.0;
 
 /// Occasional gusts of wind. Between gusts nothing moves, so the app can idle.
 pub struct Breeze {
@@ -184,10 +184,10 @@ const GLOW_W: f32 = 8.0;
 /// swing period, so taller cards swing more slowly.
 const SWING_G: f32 = 3000.0;
 /// Air drag on the swing.
-const SWING_C: f32 = 1.3;
+const SWING_C: f32 = 1.7;
 /// Share of the clip's sideways acceleration that reaches the card.
-const SWING_DRIVE: f32 = 0.28;
-const SWING_MAX: f32 = 1.1;
+const SWING_DRIVE: f32 = 0.17;
+const SWING_MAX: f32 = 0.6;
 
 #[derive(Clone, Copy, Default)]
 pub struct Spring {

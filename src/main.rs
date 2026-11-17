@@ -88,7 +88,7 @@ const MAX_RETRIES: u32 = 5;
 /// Downward kick on the rope where a clicked card is unclipped.
 const RESTORE_KICK: f32 = 90.0;
 /// Push given to a card when the pointer brushes it (rad/s).
-const HOVER_NUDGE: f32 = 0.9;
+const HOVER_NUDGE: f32 = 0.55;
 /// A new card starts this much larger and shrinks onto the line.
 const GROW_START: f32 = 0.25;
 /// A new card always flies at least this far up to the line.
