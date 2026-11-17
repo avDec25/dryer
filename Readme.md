@@ -12,6 +12,14 @@ Dryer has no window. A thin rope hangs across the top of your primary monitor, a
 
 Built with Rust, Win32, Direct2D and DirectComposition (plus DirectWrite for text).
 
+## Install
+
+Download **DryerSetup-<version>.exe** from the [latest release](https://github.com/avDec25/dryer/releases/latest) and run it.
+
+- It installs for your account only, so it needs no administrator rights. The default folder is `%LOCALAPPDATA%\Programs\Dryer`.
+- You can choose to start Dryer when you sign in (this can also be switched later from the tray menu) and to add a desktop shortcut.
+- Dryer appears in the Start menu and under Settings, Apps. Uninstalling asks whether to delete your saved clipboard history as well.
+- The installer is not code-signed, so Windows SmartScreen may say it protected your PC the first time. Choose **More info**, then **Run anyway**. Each release lists a SHA-256 checksum you can compare with `Get-FileHash DryerSetup-<version>.exe`.
 ## Controls
 
 | Action | How |
@@ -69,6 +77,15 @@ The release binary is `target\release\dryer.exe`. It is a single file with no in
 cargo test
 ```
 
+### Building the installer
+
+The installer is made with [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`):
+
+```powershell
+powershell -File tools\build-installer.ps1
+```
+
+This builds the release exe, then writes `dist\DryerSetup-<version>.exe` and its `.sha256` file. The version comes from `Cargo.toml`. The installer definition is `installer\dryer.iss`.
 ## Changing the icon
 
 Replace `icon.png` (a square picture, 256 px or larger), run `powershell -File tools\make-icon.ps1` to rebuild `icon.ico` from it, then rebuild. The icon is embedded in the exe, used for the tray icon, and shown by Explorer and Task Manager.
@@ -86,6 +103,8 @@ The feel of the motion is set by a few constants at the top of `src\physics.rs`:
 | `src\ring.rs` | The fixed 10-slot history |
 | `src\sound.rs` | The copy beep (`copy-beep.mp3`, embedded in the exe) |
 | `src\store.rs` | Saving the history to disk (encrypted) and loading it at startup |
+| `installer\dryer.iss` | The Inno Setup script for the installer |
+| `tools\build-installer.ps1` | Builds the release exe and the installer into `dist\` |
 | `build.rs` | Embeds `icon.ico` in the exe as the application icon (no extra tools needed) |
 | `icon.png` / `icon.ico` | The application icon, and the multi-size version of it built from the PNG |
 | `tools\make-icon.ps1` | Rebuilds `icon.ico` from `icon.png` |
