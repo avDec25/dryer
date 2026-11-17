@@ -13,7 +13,8 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
     D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Bitmap1,
-    ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image, ID2D1SolidColorBrush,
+    ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -24,10 +25,11 @@ use windows::Win32::Graphics::DirectComposition::{
 };
 use windows::Win32::Graphics::DirectWrite::IDWriteTextLayout;
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
 };
 use windows::core::{Interface, Result};
@@ -124,8 +126,8 @@ pub struct Scene {
     ctx: ID2D1DeviceContext,
     factory: ID2D1Factory1,
     swap: IDXGISwapChain1,
-    /// The swap chain's back buffer as a Direct2D target.
-    target: ID2D1Bitmap1,
+    /// The swap chain's back buffer as a Direct2D target (None while resizing).
+    target: Option<ID2D1Bitmap1>,
     dpi: f32,
     /// Vertical offset of the whole line in pixels (negative slides it up out of view).
     offset: Cell<f32>,
@@ -204,7 +206,7 @@ impl Scene {
                 ctx,
                 factory,
                 swap,
-                target,
+                target: Some(target),
                 dpi: dpi as f32,
                 offset: Cell::new(0.0),
                 brush,
@@ -215,6 +217,38 @@ impl Scene {
                 _d3d: d3d,
             })
         }
+    }
+
+    /// Resize the swap chain to match the window, keeping the device and every
+    /// cached card bitmap. The next frame must be drawn afterwards.
+    pub fn resize(&mut self, width_px: i32, height_px: i32) -> Result<()> {
+        unsafe {
+            // Nothing may still reference the old back buffer.
+            self.ctx.SetTarget(None::<&ID2D1Image>);
+            self.target = None;
+            self.swap.ResizeBuffers(
+                0,
+                width_px as u32,
+                height_px as u32,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            )?;
+            let surface: IDXGISurface = self.swap.GetBuffer(0)?;
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: self.dpi,
+                dpiY: self.dpi,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                ..Default::default()
+            };
+            let target = self.ctx.CreateBitmapFromDxgiSurface(&surface, Some(&props))?;
+            self.ctx.SetTarget(&target);
+            self.target = Some(target);
+        }
+        Ok(())
     }
 
     /// Slide the whole line vertically by `dy` pixels. The compositor moves the
@@ -243,7 +277,9 @@ impl Scene {
                     self.ensure_sprite(clip)?;
                 }
             }
-            self.ctx.SetTarget(&self.target);
+            if let Some(target) = self.target.as_ref() {
+                self.ctx.SetTarget(target);
+            }
 
             let clear = rgba(0.0, 0.0, 0.0, 0.0);
             self.ctx.BeginDraw();

@@ -7,6 +7,7 @@
 
 mod card;
 mod clipboard;
+mod origin;
 mod physics;
 mod render;
 mod ring;
@@ -96,6 +97,8 @@ struct App {
     hwnd: HWND,
     ring: Ring,
     engine: card::Engine,
+    /// Finds where on screen the copied content was.
+    locator: origin::Locator,
     /// Clips pushed out of the ring, sliding off the left edge (absolute x in `hx`).
     departing: Vec<Clip>,
     scene: Option<render::Scene>,
@@ -132,6 +135,11 @@ struct App {
     last_event: Instant,
     /// Top-left of the monitor in screen pixels.
     origin: POINT,
+    /// Monitor height in pixels.
+    mon_h_px: i32,
+    /// The window is as tall as the monitor, so a card can fly in from anywhere on
+    /// screen; otherwise it is just the band along the top.
+    tall: bool,
     dpi: u32,
     px_w: i32,
     px_h: i32,
@@ -148,6 +156,7 @@ impl App {
             hwnd,
             ring: Ring::new(),
             engine,
+            locator: origin::Locator::new(),
             departing: Vec::new(),
             scene: None,
             rope: Rope::new(),
@@ -170,6 +179,8 @@ impl App {
             frame_ms: FRAME_MS,
             last_event: Instant::now(),
             origin: POINT::default(),
+            mon_h_px: 0,
+            tall: false,
             dpi: 96,
             px_w: 0,
             px_h: 0,
@@ -205,6 +216,18 @@ impl App {
         render::hit(&self.ring, &self.rope, self.width_dip, x, y - self.slide.x)
     }
 
+    /// Where the copied content was on screen, in window DIPs: the selected text, the
+    /// caret or the focused control; failing those, the pointer.
+    fn copy_origin(&self) -> (f32, f32) {
+        match self.locator.locate() {
+            Some((x, y)) => self.to_dip(
+                (x - self.origin.x as f32) as i32,
+                (y - self.origin.y as f32) as i32,
+            ),
+            None => self.cursor_dip(),
+        }
+    }
+
     /// The pointer position in window DIPs.
     fn cursor_dip(&self) -> (f32, f32) {
         let mut pt = POINT::default();
@@ -237,7 +260,8 @@ impl App {
             self.dpi = GetDpiForSystem().max(96);
             let s = self.scale();
             self.px_w = r.right - r.left;
-            self.px_h = (BAND_DIP * s).round() as i32;
+            self.mon_h_px = r.bottom - r.top;
+            self.px_h = if self.tall { self.mon_h_px } else { (BAND_DIP * s).round() as i32 };
             self.width_dip = self.px_w as f32 / s;
 
             // The swap chain must be recreated at the new size.
@@ -262,6 +286,38 @@ impl App {
         for c in self.departing.iter_mut() {
             c.thumb = None;
             c.sprite = None;
+        }
+    }
+
+    /// Make the window as tall as the monitor (so a card can fly in from the spot
+    /// the text was copied from) or just the band along the top.
+    fn set_tall(&mut self, tall: bool) {
+        if self.tall == tall {
+            return;
+        }
+        self.tall = tall;
+        self.px_h = if tall {
+            self.mon_h_px
+        } else {
+            (BAND_DIP * self.scale()).round() as i32
+        };
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                self.origin.x,
+                self.origin.y,
+                self.px_w,
+                self.px_h,
+                SWP_NOACTIVATE,
+            );
+        }
+        let resized = match self.scene.as_mut() {
+            Some(scene) => scene.resize(self.px_w, self.px_h).is_ok(),
+            None => true,
+        };
+        if !resized {
+            self.drop_gpu();
         }
     }
 
@@ -307,6 +363,7 @@ impl App {
 
     /// The line has fully retracted: hide the window and give back the GPU memory.
     fn finish_hide(&mut self) {
+        self.set_tall(false);
         self.visible = false;
         self.hover = None;
         unsafe {
@@ -502,6 +559,11 @@ impl App {
         // Departing clips are dropped once they have slid off the left edge.
         self.departing.retain(|c| c.motion.hx.x > -CARD_W);
 
+        // Every new card has reached the rope: the window can shrink back to the band.
+        if self.tall && self.ring.iter_mut().all(|c| c.motion.hy.x < 6.0) {
+            self.set_tall(false);
+        }
+
         let active = self.slide.active(slide_target)
             || self.rope.active()
             || self.breeze.active()
@@ -549,7 +611,7 @@ impl App {
                 self.reveal();
                 let before = self.positions();
                 let evicted = self.ring.insert(clip);
-                let from = self.cursor_dip();
+                let from = self.copy_origin();
                 self.reflow(&before, evicted, Some(from));
                 self.kick();
             }
@@ -582,18 +644,28 @@ impl App {
         self.mark_event();
         let w = self.width_dip;
         let n = self.ring.len();
+        let mon_h = self.mon_h_px as f32 / self.scale();
+        let mut needs_tall = false;
         for i in 0..n {
             let Some(c) = self.ring.get_mut(i) else { continue };
             let base = card::slot_x(i, n, w);
             match before.iter().find(|(h, _)| *h == c.hash) {
                 Some(&(_, old_x)) => c.motion.shift(old_x - (base + c.motion.hx.x)),
                 None => {
+                    // The card starts where the content was copied from, anywhere on screen.
                     let (ax, ay) = arrival.unwrap_or((base + CARD_W, 0.0));
                     let rest_top = ROPE_Y + PEG_DROP;
-                    let dy = (ay - rest_top).clamp(MIN_FLIGHT, BAND_DIP - rest_top);
+                    let dy = (ay - rest_top).clamp(MIN_FLIGHT, (mon_h - rest_top).max(MIN_FLIGHT));
+                    // Below the band? Then the window must cover the screen for the flight.
+                    if rest_top + dy + c.card_h + 20.0 > BAND_DIP {
+                        needs_tall = true;
+                    }
                     c.motion.launch(ax.clamp(0.0, w) - base, dy, GROW_START);
                 }
             }
+        }
+        if needs_tall {
+            self.set_tall(true);
         }
         if let Some(mut c) = evicted {
             let old_x = before
