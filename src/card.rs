@@ -3,7 +3,8 @@
 
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
     DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
     DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
     IDWriteTextLayout,
@@ -15,6 +16,8 @@ use crate::clipboard::{Clip, Kind};
 pub const CARD_W: f32 = 150.0;
 /// Gap between neighbouring cards on the line.
 pub const CARD_GAP: f32 = 26.0;
+/// Height of the "Copied" toast under a card (its width fits its contents).
+pub const TOAST_H: f32 = 26.0;
 pub const MARGIN: f32 = 24.0;
 pub const MIN_CARD_H: f32 = 100.0;
 pub const MAX_CARD_H: f32 = 220.0;
@@ -65,6 +68,7 @@ pub struct Engine {
     factory: IDWriteFactory,
     body: IDWriteTextFormat,
     small: IDWriteTextFormat,
+    toast: IDWriteTextFormat,
 }
 
 impl Engine {
@@ -102,8 +106,26 @@ impl Engine {
                 w!("en-us"),
             )?;
             small.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            Ok(Self { factory, body, small })
+
+            let toast = factory.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                11.0,
+                w!("en-us"),
+            )?;
+            toast.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            toast.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            toast.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            Ok(Self { factory, body, small, toast })
         }
+    }
+
+    /// The text of the toast, as tall as the toast so it centres vertically.
+    pub fn toast_label(&self, text: &str) -> Result<IDWriteTextLayout> {
+        self.layout(text, &self.toast, 200.0, TOAST_H)
     }
 
     fn layout(&self, text: &str, format: &IDWriteTextFormat, w: f32, h: f32) -> Result<IDWriteTextLayout> {

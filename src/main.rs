@@ -45,6 +45,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::card::CARD_W;
+use windows::Win32::Graphics::DirectWrite::IDWriteTextLayout;
 use crate::clipboard::{Capture, Clip};
 use crate::physics::{Breeze, Rope, Spring};
 use crate::render::{PEG_DROP, ROPE_Y};
@@ -52,6 +53,8 @@ use crate::ring::Ring;
 
 /// Tall enough for the tallest card hanging from a sagging rope.
 const BAND_DIP: f32 = 300.0;
+/// How long the "Copied" toast lasts, counting its fade in and out.
+const TOAST_S: f32 = 3.0;
 const WM_TRAY: u32 = WM_APP + 1;
 const TIMER_FRAME: usize = 1;
 const TIMER_RETRY: usize = 2;
@@ -84,18 +87,25 @@ const CMD_CLEAR: usize = 3;
 const CMD_SOUND: usize = 4;
 const CMD_AUTOSTART: usize = 5;
 const CMD_DELETE_CARD: usize = 6;
+const CMD_COPY_PLAIN: usize = 7;
+const CF_UNICODETEXT: u32 = 13;
 const RETRY_MS: u32 = 15;
 const MAX_RETRIES: u32 = 5;
 /// Downward kick on the rope where a clicked card is unclipped.
 const RESTORE_KICK: f32 = 90.0;
-/// Push given to a card when the pointer brushes it (rad/s).
-const HOVER_NUDGE: f32 = 0.55;
 /// A new card starts this much larger and shrinks onto the line.
 const GROW_START: f32 = 0.25;
 /// A new card always flies at least this far up to the line.
 const MIN_FLIGHT: f32 = 40.0;
 
 /// Breeze phase for a card: differs per card, and travels along the line.
+/// Opacity of the toast `t` seconds in: a quick fade in, a hold, a slower fade out.
+fn toast_alpha(t: f32) -> f32 {
+    const FADE_IN: f32 = 0.12;
+    const FADE_OUT: f32 = 0.7;
+    (t / FADE_IN).min((TOAST_S - t) / FADE_OUT).clamp(0.0, 1.0)
+}
+
 fn wind_phase(hash: u64, cx: f32) -> f32 {
     (hash % 6283) as f32 / 1000.0 - cx * 0.004
 }
@@ -141,6 +151,11 @@ struct App {
     shown_at: Instant,
     polls: u32,
     hover: Option<usize>,
+    /// The card whose right-click menu is open (by content hash); it is held still.
+    menu_hash: Option<u64>,
+    /// The card that was just copied from the line, and when: "Copied" shows under it.
+    toast: Option<(u64, Instant)>,
+    toast_label: IDWriteTextLayout,
     tracking_mouse: bool,
     /// Sequence number produced by our own clipboard write; changes with it are ignored.
     own_seq: u32,
@@ -170,6 +185,7 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(1);
+        let toast_label = engine.toast_label("Copied").expect("DirectWrite is unavailable");
         Self {
             hwnd,
             ring: Ring::new(),
@@ -192,6 +208,9 @@ impl App {
             shown_at: Instant::now(),
             polls: 0,
             hover: None,
+            menu_hash: None,
+            toast: None,
+            toast_label,
             tracking_mouse: false,
             own_seq: 0,
             retries: 0,
@@ -378,7 +397,7 @@ impl App {
     /// Raise the line out of view; the window is hidden once it has gone.
     fn hide(&mut self) {
         self.want_shown = false;
-        self.set_hover(None, 0.0);
+        self.set_hover(None);
         self.kick();
     }
 
@@ -456,6 +475,13 @@ impl App {
             return;
         }
 
+        // A context menu is open: leave the window, the line and its click
+        // handling alone, or the menu would be dismissed.
+        if self.menu_hash.is_some() {
+            self.last_event = Instant::now();
+            return;
+        }
+
         let (x, y) = self.to_dip(pt.x - self.origin.x, pt.y - self.origin.y);
         let over = self.hit(x, y).is_some();
         self.set_click_through(!over);
@@ -526,7 +552,10 @@ impl App {
         }
         if let Some(scene) = self.scene.as_ref() {
             let _ = scene.set_offset(self.slide.x * self.scale());
-            let drawn = scene.draw(&mut self.ring, &mut self.departing, &self.rope, self.width_dip);
+            let toast = self
+                .toast
+                .map(|(hash, at)| (hash, toast_alpha(at.elapsed().as_secs_f32()), &self.toast_label));
+            let drawn = scene.draw(&mut self.ring, &mut self.departing, &self.rope, self.width_dip, toast);
             if drawn.is_err() {
                 // Device lost or target invalid: rebuild on the next frame.
                 self.drop_gpu();
@@ -554,6 +583,11 @@ impl App {
             self.rope.add_load(c.motion.hx.x / w, physics::card_load(c.card_h));
         }
 
+        // The card under the pointer (or with its menu open) hangs still.
+        let held = self.menu_hash.or_else(|| {
+            self.hover.and_then(|i| self.ring.get(i)).map(|c| c.hash)
+        });
+
         while dt > 0.0 {
             let h = dt.min(physics::SUBSTEP);
             self.slide.step_to(slide_target, SLIDE_K, SLIDE_C, h);
@@ -561,6 +595,11 @@ impl App {
             self.breeze.step(h);
             for (i, c) in self.ring.iter_mut().enumerate() {
                 let cx = card::slot_x(i, n, w) + c.motion.hx.x;
+                if held == Some(c.hash) {
+                    c.motion.step(h, hang_len(c.card_h), 0.0);
+                    c.motion.hold(h);
+                    continue;
+                }
                 let wind = self.breeze.force(wind_phase(c.hash, cx));
                 c.motion.step(h, hang_len(c.card_h), wind);
             }
@@ -577,6 +616,10 @@ impl App {
             return;
         }
 
+        if self.toast.is_some_and(|(_, at)| at.elapsed().as_secs_f32() >= TOAST_S) {
+            self.toast = None;
+        }
+
         // Departing clips are dropped once they have slid off the left edge.
         self.departing.retain(|c| c.motion.hx.x > -CARD_W);
 
@@ -589,6 +632,7 @@ impl App {
             || self.rope.active()
             || self.breeze.active()
             || !self.departing.is_empty()
+            || self.toast.is_some()
             || self.ring.iter_mut().any(|c| c.motion.active());
         if !active {
             self.slide.snap(slide_target);
@@ -702,14 +746,44 @@ impl App {
         }
     }
 
+    /// Show "Copied" under clip `idx` for a moment.
+    fn show_toast(&mut self, idx: usize) {
+        let Some(hash) = self.ring.get(idx).map(|c| c.hash) else { return };
+        self.toast = Some((hash, Instant::now()));
+        self.mark_event();
+        self.kick();
+    }
+
     /// Put clip `idx` back on the clipboard as the newest item.
     fn restore(&mut self, idx: usize) {
+        self.restore_as(idx, false);
+    }
+
+    /// Like `restore`, but with `plain` only the text goes on the clipboard; that
+    /// is then captured as a new clip and the original card is left untouched.
+    fn restore_as(&mut self, idx: usize, plain: bool) {
         let seq = match self.ring.get(idx) {
+            Some(clip) if plain => {
+                let text: Vec<(u32, Vec<u8>)> =
+                    clip.formats.iter().filter(|(f, _)| *f == CF_UNICODETEXT).cloned().collect();
+                if text.is_empty() {
+                    return;
+                }
+                // Not marked as our own write: the clipboard listener picks the plain
+                // text up as a new clip, and the original card stays untouched.
+                if clipboard::write(self.hwnd, &text).is_some() {
+                    self.show_toast(idx);
+                }
+                return;
+            }
             Some(clip) => clipboard::write(self.hwnd, &clip.formats),
             None => return,
         };
         if let Some(s) = seq {
             self.own_seq = s;
+            // The card is now the latest copy: confirm it like any other copy.
+            self.sound.play();
+            self.show_toast(idx);
         }
         let before = self.positions();
         if let Some(&(_, x)) = before.get(idx) {
@@ -768,17 +842,14 @@ impl App {
         }
     }
 
-    /// The pointer brushed a card: push it away from the side the pointer came from.
-    fn set_hover(&mut self, h: Option<usize>, x: f32) {
+    /// The pointer moved onto a card (or off one); the card under it is held still.
+    fn set_hover(&mut self, h: Option<usize>) {
         if self.hover == h {
             return;
         }
         self.hover = h;
-        let Some(i) = h else { return };
-        let (n, w) = (self.ring.len(), self.width_dip);
-        if let Some(c) = self.ring.get_mut(i) {
-            let cx = card::slot_x(i, n, w) + c.motion.hx.x;
-            c.motion.nudge((x - cx).signum() * HOVER_NUDGE);
+        if h.is_none() {
+            return;
         }
         self.mark_event();
         self.kick();
@@ -826,12 +897,12 @@ impl App {
         }
         let (x, y) = self.to_dip(lparam_x(lp), lparam_y(lp));
         let h = self.hit(x, y);
-        self.set_hover(h, x);
+        self.set_hover(h);
     }
 
     fn on_mouse_leave(&mut self) {
         self.tracking_mouse = false;
-        self.set_hover(None, 0.0);
+        self.set_hover(None);
     }
 
     /// Cards catch the mouse; everything else passes clicks through to the window below.
@@ -844,7 +915,7 @@ impl App {
         if self.hit(x, y).is_some() {
             LRESULT(HTCLIENT as isize)
         } else {
-            self.set_hover(None, x);
+            self.set_hover(None);
             LRESULT(HTTRANSPARENT as isize)
         }
     }
@@ -920,18 +991,32 @@ fn app_icon(small: bool) -> HICON {
     }
 }
 
-/// Right-click menu for a card; true if the user chose "Delete". Takes no `App`
-/// because the menu's message loop re-enters `wndproc`.
-fn card_menu_wants_delete(hwnd: HWND) -> bool {
+/// What the user picked from a card's right-click menu.
+enum CardAction {
+    None,
+    Delete,
+    CopyPlain,
+}
+
+/// Right-click menu for a card. Takes no `App` because the menu's message loop
+/// re-enters `wndproc`.
+fn card_menu(hwnd: HWND, can_copy_plain: bool) -> CardAction {
     unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return false };
+        let Ok(menu) = CreatePopupMenu() else { return CardAction::None };
+        if can_copy_plain {
+            let _ = AppendMenuW(menu, MF_STRING, CMD_COPY_PLAIN, w!("Copy as plain text"));
+        }
         let _ = AppendMenuW(menu, MF_STRING, CMD_DELETE_CARD, w!("Delete"));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, Some(0), hwnd, None);
         let _ = DestroyMenu(menu);
-        cmd.0 as usize == CMD_DELETE_CARD
+        match cmd.0 as usize {
+            CMD_DELETE_CARD => CardAction::Delete,
+            CMD_COPY_PLAIN => CardAction::CopyPlain,
+            _ => CardAction::None,
+        }
     }
 }
 
@@ -963,10 +1048,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_RBUTTONUP => {
                 let (x, y) = app.to_dip(lparam_x(lp), lparam_y(lp));
-                let hash = app.hit(x, y).and_then(|i| app.ring.get(i)).map(|c| c.hash);
-                if let Some(hash) = hash {
-                    if card_menu_wants_delete(hwnd) {
-                        app.delete_clip(hash);
+                let card = app
+                    .hit(x, y)
+                    .and_then(|i| app.ring.get(i))
+                    // "Copy as plain text" is offered only when there is formatting to strip.
+                    .map(|c| (c.hash, c.is_rich_text()));
+                if let Some((hash, can_plain)) = card {
+                    app.menu_hash = Some(hash);
+                    app.kick();
+                    let action = card_menu(hwnd, can_plain);
+                    app.menu_hash = None;
+                    let idx = (0..app.ring.len()).find(|&i| app.ring.get(i).is_some_and(|c| c.hash == hash));
+                    match (action, idx) {
+                        (CardAction::Delete, _) => app.delete_clip(hash),
+                        (CardAction::CopyPlain, Some(i)) => app.restore_as(i, true),
+                        _ => app.kick(),
                     }
                 }
             }

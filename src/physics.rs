@@ -258,11 +258,6 @@ impl Motion {
         self.hx.x = abs_x;
     }
 
-    /// A push on the card (e.g. from the pointer), in rad/s.
-    pub fn nudge(&mut self, angular_velocity: f32) {
-        self.swing.v += angular_velocity;
-    }
-
     /// Advance one substep. `hang` is the distance from the clip to the card's
     /// centre; `wind` is the sideways push of the breeze (DIP/s²).
     pub fn step(&mut self, dt: f32, hang: f32, wind: f32) {
@@ -290,6 +285,15 @@ impl Motion {
         if s.x.abs() > SWING_MAX {
             s.x = s.x.clamp(-SWING_MAX, SWING_MAX);
             s.v = 0.0;
+        }
+    }
+
+    /// Damp the swing to a stop (a card under the pointer hangs still).
+    pub fn hold(&mut self, dt: f32) {
+        self.swing.v = 0.0;
+        self.swing.x *= (-20.0 * dt).exp();
+        if self.swing.x.abs() < 0.001 {
+            self.swing.x = 0.0;
         }
     }
 

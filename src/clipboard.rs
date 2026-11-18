@@ -80,6 +80,17 @@ pub struct Clip {
     pub motion: Motion,
 }
 
+impl Clip {
+    /// Text that carries more than its plain characters (HTML, RTF, ...), so a
+    /// plain-text copy would differ from it. Only the formats Dryer keeps are
+    /// stored, so anything besides the Unicode text is formatting.
+    pub fn is_rich_text(&self) -> bool {
+        self.kind == Kind::Text
+            && self.formats.iter().any(|(f, _)| *f == CF_UNICODETEXT)
+            && self.formats.iter().any(|(f, _)| *f != CF_UNICODETEXT)
+    }
+}
+
 pub enum Capture {
     /// Another app holds the clipboard; try again shortly.
     Busy,
