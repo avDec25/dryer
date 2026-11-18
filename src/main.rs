@@ -83,6 +83,7 @@ const CMD_QUIT: usize = 2;
 const CMD_CLEAR: usize = 3;
 const CMD_SOUND: usize = 4;
 const CMD_AUTOSTART: usize = 5;
+const CMD_DELETE_CARD: usize = 6;
 const RETRY_MS: u32 = 15;
 const MAX_RETRIES: u32 = 5;
 /// Downward kick on the rope where a clicked card is unclipped.
@@ -652,6 +653,20 @@ impl App {
         self.kick();
     }
 
+    /// Remove the clip with this content hash from the line and from disk; it
+    /// slides off like an evicted card while the others close the gap.
+    fn delete_clip(&mut self, hash: u64) {
+        let Some(idx) = (0..self.ring.len()).find(|&i| self.ring.get(i).is_some_and(|c| c.hash == hash))
+        else {
+            return;
+        };
+        let before = self.positions();
+        let removed = self.ring.remove(idx);
+        self.reflow(&before, removed, None);
+        self.mark_dirty();
+        self.kick();
+    }
+
     fn on_clipboard_update(&mut self) {
         let seq = unsafe { GetClipboardSequenceNumber() };
         if seq != 0 && seq == self.own_seq {
@@ -905,6 +920,21 @@ fn app_icon(small: bool) -> HICON {
     }
 }
 
+/// Right-click menu for a card; true if the user chose "Delete". Takes no `App`
+/// because the menu's message loop re-enters `wndproc`.
+fn card_menu_wants_delete(hwnd: HWND) -> bool {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return false };
+        let _ = AppendMenuW(menu, MF_STRING, CMD_DELETE_CARD, w!("Delete"));
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, Some(0), hwnd, None);
+        let _ = DestroyMenu(menu);
+        cmd.0 as usize == CMD_DELETE_CARD
+    }
+}
+
 fn lparam_x(lp: LPARAM) -> i32 {
     (lp.0 & 0xFFFF) as i16 as i32
 }
@@ -929,6 +959,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let (x, y) = app.to_dip(lparam_x(lp), lparam_y(lp));
                 if let Some(i) = app.hit(x, y) {
                     app.restore(i);
+                }
+            }
+            WM_RBUTTONUP => {
+                let (x, y) = app.to_dip(lparam_x(lp), lparam_y(lp));
+                let hash = app.hit(x, y).and_then(|i| app.ring.get(i)).map(|c| c.hash);
+                if let Some(hash) = hash {
+                    if card_menu_wants_delete(hwnd) {
+                        app.delete_clip(hash);
+                    }
                 }
             }
             WM_CLIPBOARDUPDATE => app.on_clipboard_update(),

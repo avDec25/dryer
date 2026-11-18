@@ -69,6 +69,17 @@ impl Ring {
         }
     }
 
+    /// Remove and return the clip at `i`; older clips move up one slot.
+    pub fn remove(&mut self, i: usize) -> Option<Clip> {
+        if i >= self.len {
+            return None;
+        }
+        let clip = self.slots[i].take();
+        self.slots[i..self.len].rotate_left(1);
+        self.len -= 1;
+        clip
+    }
+
     /// Drop cached GPU bitmaps (after a device loss or resize).
     pub fn clear_gpu_cache(&mut self) {
         for c in self.iter_mut() {
@@ -132,6 +143,19 @@ mod tests {
         assert!(r.insert(clip(2)).is_none());
         assert_eq!(r.len(), 4);
         assert_eq!(hashes(&r), vec![2, 4, 3, 1]);
+    }
+
+    #[test]
+    fn remove_closes_the_gap() {
+        let mut r = Ring::new();
+        for h in 1..=4 {
+            r.insert(clip(h));
+        }
+        assert_eq!(r.remove(1).map(|c| c.hash), Some(3));
+        assert_eq!(hashes(&r), vec![4, 2, 1]);
+        assert!(r.remove(3).is_none());
+        r.insert(clip(9));
+        assert_eq!(hashes(&r), vec![9, 4, 2, 1]);
     }
 
     #[test]
