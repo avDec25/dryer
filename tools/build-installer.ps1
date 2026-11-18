@@ -1,16 +1,24 @@
-# Builds the Windows installer: dist\DryerSetup-<version>.exe
+# Builds the Windows installer, dist\DryerSetup-<version>.exe, and the portable
+# zip, dist\dryer-<version>-windows-x64-portable.zip, with dist\SHA256SUMS.txt.
+#
+# The version is the build time, YYYY.MM.DD.HHMM (e.g. 2026.11.18.1420). It is
+# passed to cargo as DRYER_VERSION, so the tray menu of the exe shows the same one.
 #
 # Needs Rust (cargo) and Inno Setup 6 (winget install JRSoftware.InnoSetup).
 # Run from the repository root:  powershell -File tools\build-installer.ps1
-# Use -SkipBuild to package an exe that was already built with `cargo build --release`.
+# Use -SkipBuild with -Version to package an exe that was already built with
+# `$env:DRYER_VERSION = "<version>"; cargo build --release`.
 
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [string]$Version)
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
-$version = ((Get-Content Cargo.toml | Select-String '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value)
-
-if (-not $SkipBuild) {
+if ($SkipBuild) {
+    if (-not $Version) { throw "-SkipBuild needs -Version, the stamp the exe was built with" }
+    $version = $Version
+} else {
+    $version = Get-Date -Format "yyyy.MM.dd.HHmm"
+    $env:DRYER_VERSION = $version
     cargo build --release
     if ($LASTEXITCODE) { throw "cargo build failed" }
 }
@@ -32,5 +40,14 @@ if ($LASTEXITCODE) { throw "Inno Setup failed" }
 $setup = "dist\DryerSetup-$version.exe"
 $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
 Set-Content -Path "$setup.sha256" -Value "$hash  DryerSetup-$version.exe" -Encoding ascii
+$zip = "dist\dryer-$version-windows-x64-portable.zip"
+Compress-Archive -Path $exe, "Readme.md" -DestinationPath $zip -Force
+$sums = foreach ($f in @($setup, $zip)) {
+    "$((Get-FileHash $f -Algorithm SHA256).Hash.ToLower())  $(Split-Path $f -Leaf)"
+}
+Set-Content -Path "dist\SHA256SUMS.txt" -Value $sums -Encoding ascii
+
+"Version $version"
+"Built $zip"
 "Built $setup ($([math]::Round((Get-Item $setup).Length / 1KB)) KB)"
 "SHA256 $hash"

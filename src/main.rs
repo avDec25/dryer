@@ -967,6 +967,10 @@ impl App {
     fn show_tray_menu(&self) {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
+            let version: Vec<u16> =
+                concat!("Dryer ", env!("DRYER_VERSION")).encode_utf16().chain(Some(0)).collect();
+            let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(version.as_ptr()));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE, w!("Show / Hide"));
             let autostart_flags =
                 if autostart::is_enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };

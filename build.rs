@@ -1,4 +1,8 @@
-//! Embeds `icon.ico` in the executable as the application icon.
+//! Stamps the build with its version and embeds `icon.ico` as the application icon.
+//!
+//! The version is the local build time, `YYYY.MM.DD.HHMM`, passed to the program
+//! as `DRYER_VERSION`. `toolsuild-installer.ps1` sets `DRYER_VERSION` itself so
+//! the exe, the installer and the release all carry the same stamp.
 //!
 //! Instead of calling the Windows resource compiler (rc.exe), this writes the small
 //! binary `.res` file by hand and hands it to the MSVC linker, so the build needs no
@@ -8,6 +12,7 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 const RT_ICON: u16 = 3;
 const RT_GROUP_ICON: u16 = 14;
@@ -18,6 +23,15 @@ const APP_ICON_ID: u16 = 1;
 fn main() {
     println!("cargo:rerun-if-changed=icon.ico");
     println!("cargo:rerun-if-changed=build.rs");
+    // Restamp whenever the code changes, so a build shows when it was made.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-env-changed=DRYER_VERSION");
+    let version = env::var("DRYER_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(build_time)
+        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    println!("cargo:rustc-env=DRYER_VERSION={}", version.trim());
 
     // Only the MSVC linker takes a .res file directly.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
@@ -31,6 +45,17 @@ fn main() {
     let path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("icon.res");
     fs::write(&path, res).expect("could not write icon.res");
     println!("cargo:rustc-link-arg-bins={}", path.display());
+}
+
+/// The local time now as `YYYY.MM.DD.HHMM`. The standard library has no local
+/// time zone, so ask PowerShell, which every supported Windows has.
+fn build_time() -> Option<String> {
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", "Get-Date -Format yyyy.MM.dd.HHmm"])
+        .output()
+        .ok()?;
+    let stamp = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !stamp.is_empty()).then_some(stamp)
 }
 
 fn u16_at(b: &[u8], at: usize) -> u16 {

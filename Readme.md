@@ -85,7 +85,7 @@ The installer is made with [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`w
 powershell -File tools\build-installer.ps1
 ```
 
-This builds the release exe, then writes `dist\DryerSetup-<version>.exe` and its `.sha256` file. The version comes from `Cargo.toml`. The installer definition is `installer\dryer.iss`.
+This builds the release exe, then writes `dist\DryerSetup-<version>.exe` (with its `.sha256` file), the portable zip `dist\dryer-<version>-windows-x64-portable.zip` and `dist\SHA256SUMS.txt`. The version is the build time, `YYYY.MM.DD.HHMM` (for example `2026.11.18.1420`), and the tray menu shows it at the top. The installer definition is `installer\dryer.iss`.
 ## Changing the icon
 
 Replace `icon.png` (a square picture, 256 px or larger), run `powershell -File tools\make-icon.ps1` to rebuild `icon.ico` from it, then rebuild. The icon is embedded in the exe, used for the tray icon, and shown by Explorer and Task Manager.
