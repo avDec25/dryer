@@ -63,6 +63,69 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "{app}\dryer.exe"; Description: "Start Dryer now"; Flags: nowait postinstall skipifsilent
 
 [Code]
+const
+  // Where Inno Setup registers this app (by AppId) for Apps & features.
+  UninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{F547F428-711A-47BC-BA43-B6629171EA54}_is1';
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+
+var
+  HadAutostart: Boolean;
+
+// The uninstaller of an installed Dryer, per user or for all users, if there is one.
+function PreviousUninstaller(var Uninstaller: String): Boolean;
+begin
+  Result := RegQueryStringValue(HKCU, UninstallKey, 'UninstallString', Uninstaller)
+    or RegQueryStringValue(HKLM64, UninstallKey, 'UninstallString', Uninstaller)
+    or RegQueryStringValue(HKLM32, UninstallKey, 'UninstallString', Uninstaller);
+  if Result then
+  begin
+    Uninstaller := RemoveQuotes(Uninstaller);
+    Result := FileExists(Uninstaller);
+  end;
+end;
+
+// Remove the installed version before the new one goes in, so Apps & features
+// lists exactly one Dryer, with the new version. The silent uninstall keeps the
+// saved clipboard history.
+procedure RemovePreviousVersion();
+var
+  Uninstaller: String;
+  Code, Waited: Integer;
+begin
+  if not PreviousUninstaller(Uninstaller) then
+    exit;
+  WizardForm.StatusLabel.Caption := 'Removing the previous version of Dryer...';
+  // ShellExec, not Exec: an all-users install needs its uninstaller elevated.
+  if not ShellExec('', Uninstaller, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '',
+                   SW_HIDE, ewWaitUntilTerminated, Code) then
+  begin
+    MsgBox('The previous version of Dryer could not be removed (' + SysErrorMessage(Code) +
+           '). The new version will be installed over it.', mbError, MB_OK);
+    exit;
+  end;
+  // The uninstaller finishes from a temporary copy of itself, and deleting its own
+  // exe is the last thing it does: wait for that, so it cannot remove anything
+  // (such as the start-at-login entry) after the new version is in.
+  Waited := 0;
+  while FileExists(Uninstaller) and (Waited < 30000) do
+  begin
+    Sleep(250);
+    Waited := Waited + 250;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then
+  begin
+    // The uninstall removes the start-at-login entry; remember it to put it back.
+    HadAutostart := RegValueExists(HKCU, RunKey, 'Dryer');
+    RemovePreviousVersion();
+  end
+  else if (CurStep = ssPostInstall) and HadAutostart then
+    RegWriteStringValue(HKCU, RunKey, 'Dryer', '"' + ExpandConstant('{app}\dryer.exe') + '"');
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
