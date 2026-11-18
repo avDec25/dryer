@@ -90,6 +90,10 @@ const CMD_DELETE_CARD: usize = 6;
 const CMD_COPY_PLAIN: usize = 7;
 const CF_UNICODETEXT: u32 = 13;
 const RETRY_MS: u32 = 15;
+/// One copy can reach the clipboard in several writes (a terminal copies the
+/// selection, then the app copies the same text again). Identical content seen
+/// again within this window is the same copy, not a new one.
+const SAME_COPY_MS: u128 = 1500;
 const MAX_RETRIES: u32 = 5;
 /// Downward kick on the rope where a clicked card is unclipped.
 const RESTORE_KICK: f32 = 90.0;
@@ -160,6 +164,8 @@ struct App {
     /// Sequence number produced by our own clipboard write; changes with it are ignored.
     own_seq: u32,
     retries: u32,
+    /// Content hash and time of the last capture, to fold repeated writes of one copy.
+    last_capture: Option<(u64, Instant)>,
     last_tick: Instant,
     timer_on: bool,
     frame_ms: u32,
@@ -214,6 +220,7 @@ impl App {
             tracking_mouse: false,
             own_seq: 0,
             retries: 0,
+            last_capture: None,
             last_tick: Instant::now(),
             timer_on: false,
             frame_ms: FRAME_MS,
@@ -730,6 +737,14 @@ impl App {
             }
             Capture::Skip => {}
             Capture::Got(mut clip) => {
+                let echo = self.last_capture.is_some_and(|(h, at)| {
+                    h == clip.hash && at.elapsed().as_millis() < SAME_COPY_MS
+                });
+                self.last_capture = Some((clip.hash, Instant::now()));
+                // Already the newest card: the same copy written again, so no second beep.
+                if echo && self.ring.get(0).is_some_and(|c| c.hash == clip.hash) {
+                    return;
+                }
                 // First thing: the beep should come with the copy, not after the animation.
                 self.sound.play();
                 // Lay out the text and fix the card height once, up front.
