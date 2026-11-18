@@ -30,9 +30,11 @@ const CF_DIB: u32 = 8;
 const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
 const CF_DIBV5: u32 = 17;
+const CF_LOCALE: u32 = 16;
 
-/// Registered clipboard formats that are only plumbing, not worth naming on a card.
-const NOISY_FORMATS: [&str; 8] = [
+/// Registered clipboard formats that are only plumbing: not worth naming on a card,
+/// and nothing an app can paste on their own.
+const NOISY_FORMATS: [&str; 12] = [
     "Ole Private Data",
     "DataObject",
     "Preferred DropEffect",
@@ -41,6 +43,10 @@ const NOISY_FORMATS: [&str; 8] = [
     "Clipboard Viewer Ignore",
     "FileName",
     "FileNameW",
+    "Chromium internal source URL",
+    "Chromium internal source RFH token",
+    "Object Descriptor",
+    "Link Source Descriptor",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -148,6 +154,10 @@ unsafe fn read_clip() -> Option<Clip> {
     unsafe {
         let exclude = format_id(w!("ExcludeClipboardContentFromMonitorProcessing"));
         if is_available(exclude) {
+            return None;
+        }
+        // Set by clipboard tools (and some apps) on data viewers should leave alone.
+        if is_available(format_id(w!("Clipboard Viewer Ignore"))) {
             return None;
         }
         let include = format_id(w!("CanIncludeInClipboardHistory"));
@@ -284,13 +294,30 @@ unsafe fn read_all_formats() -> Option<(Vec<(u32, Vec<u8>)>, String)> {
             }
             fmt = EnumClipboardFormats(fmt);
         }
-        if formats.is_empty() {
+        // Only plumbing (OLE handles, drop effects, locale): nothing could be pasted.
+        if !has_pastable_data(&formats) {
             return None;
         }
         names.truncate(MAX_FORMAT_NAMES);
         let label = if names.is_empty() { "Clipboard data".to_string() } else { names.join("\n") };
         Some((formats, label))
     }
+}
+
+/// Whether a format carries no content of its own, only bookkeeping that rides
+/// along with real data. Unnamed registered formats count as plumbing too.
+fn is_plumbing(fmt: u32) -> bool {
+    match fmt {
+        CF_LOCALE => true,
+        0xC000.. => format_name(fmt).is_none_or(|n| NOISY_FORMATS.contains(&n.as_str())),
+        _ => false,
+    }
+}
+
+/// Whether any of these formats holds data an app could paste. A clip made only
+/// of plumbing would show as "Clipboard data" but paste as nothing.
+pub fn has_pastable_data(formats: &[(u32, Vec<u8>)]) -> bool {
+    formats.iter().any(|(fmt, bytes)| !bytes.is_empty() && !is_plumbing(*fmt))
 }
 
 /// The name of a registered clipboard format (id 0xC000 and up).
@@ -374,6 +401,16 @@ mod tests {
             assert_eq!(days_from_civil(y, m, d), days, "day {days}");
         }
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn plumbing_alone_is_not_pastable() {
+        let drop_effect = format_id(w!("Preferred DropEffect"));
+        let unnamed_free = 0xFFFF; // no format is registered with this id
+        assert!(!has_pastable_data(&[(CF_LOCALE, vec![9, 4, 0, 0]), (drop_effect, vec![1, 0, 0, 0])]));
+        assert!(!has_pastable_data(&[(unnamed_free, vec![1])]));
+        assert!(!has_pastable_data(&[(format_id(w!("Biff12")), Vec::new())]));
+        assert!(has_pastable_data(&[(drop_effect, vec![1]), (format_id(w!("Biff12")), vec![1])]));
     }
 
     #[test]

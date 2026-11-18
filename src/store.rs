@@ -18,7 +18,7 @@ use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::core::PCWSTR;
 
 use crate::card::MIN_CARD_H;
-use crate::clipboard::{Clip, Kind, format_name, local_minutes, time_label};
+use crate::clipboard::{Clip, Kind, format_name, has_pastable_data, local_minutes, time_label};
 use crate::physics::Motion;
 
 const MAGIC: &[u8; 4] = b"DRY1";
@@ -95,7 +95,10 @@ impl Store {
             .filter_map(|hash| {
                 let bytes = fs::read(self.clip_path(hash)).ok()?;
                 let clip = deserialize(&unprotect(&bytes)?)?;
-                (clip.hash == hash).then_some(clip)
+                // Drop clips saved before plumbing-only data was filtered out:
+                // they hold nothing that can be pasted.
+                let pastable = clip.kind != Kind::Other || has_pastable_data(&clip.formats);
+                (clip.hash == hash && pastable).then_some(clip)
             })
             .collect()
     }
