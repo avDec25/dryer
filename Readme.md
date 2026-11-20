@@ -27,6 +27,7 @@ Download **DryerSetup-<version>.exe** from the [latest release](https://github.c
 | Restore a clip | Click its card |
 | Show the line | Move the pointer to the very top edge of the screen and rest there or click, copy something, press `Win+Shift+C`, or left-click the tray icon |
 | Hide the line | Click anywhere outside the cards; it also retracts by itself after about 6 seconds with nothing happening; or press `Win+Shift+C` / left-click the tray icon |
+| Reveal only on a click | Right-click the tray icon, then Reveal on click only (checked means the line appears only when you click at the very top edge; resting the pointer there does nothing) |
 | Start Dryer when you log in | Right-click the tray icon, then Start with Windows (checked means on) |
 | Turn the copy beep on or off | Right-click the tray icon, then Copy sound (checked means on) |
 | Erase all saved clips | Right-click the tray icon, then Clear history |

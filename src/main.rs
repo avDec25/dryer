@@ -88,6 +88,29 @@ const CMD_SOUND: usize = 4;
 const CMD_AUTOSTART: usize = 5;
 const CMD_DELETE_CARD: usize = 6;
 const CMD_COPY_PLAIN: usize = 7;
+const CMD_CLICK_REVEAL: usize = 8;
+/// Present (in `%LOCALAPPDATA%\Dryer`) when the line only appears on a click at the top edge.
+const CLICK_REVEAL_MARKER: &str = "click-reveal";
+
+fn marker_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|b| std::path::PathBuf::from(b).join("Dryer").join(CLICK_REVEAL_MARKER))
+}
+
+fn load_click_reveal() -> bool {
+    marker_path().is_some_and(|p| p.exists())
+}
+
+fn save_click_reveal(on: bool) {
+    let Some(p) = marker_path() else { return };
+    if on {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, b"");
+    } else {
+        let _ = std::fs::remove_file(p);
+    }
+}
 const CF_UNICODETEXT: u32 = 13;
 const RETRY_MS: u32 = 15;
 /// One copy can reach the clipboard in several writes (a terminal copies the
@@ -140,6 +163,8 @@ struct App {
     visible: bool,
     /// The line should be down; false while it retracts or is tucked away.
     want_shown: bool,
+    /// Only a click on the top edge reveals the line (resting there does nothing).
+    click_reveal: bool,
     /// Vertical glide of the whole line in DIPs: 0 when down, negative when raised.
     slide: Spring,
     /// The window currently lets every click through to the windows below.
@@ -206,6 +231,7 @@ impl App {
             breeze: Breeze::new(seed),
             visible: false,
             want_shown: false,
+            click_reveal: load_click_reveal(),
             slide: Spring::default(),
             click_through: true,
             dwell: 0,
@@ -475,7 +501,7 @@ impl App {
             self.dwell = if on_edge { self.dwell + 1 } else { 0 };
             // Resting on the top edge reveals the line; so does clicking there.
             let clicked_on_edge = on_edge && (pressed || clicked_since_last_poll);
-            if self.dwell >= REVEAL_POLLS || clicked_on_edge {
+            if (!self.click_reveal && self.dwell >= REVEAL_POLLS) || clicked_on_edge {
                 self.dwell = 0;
                 self.reveal();
             }
@@ -977,6 +1003,8 @@ impl App {
             let _ = AppendMenuW(menu, autostart_flags, CMD_AUTOSTART, w!("Start with Windows"));
             let sound_flags = if self.sound.enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };
             let _ = AppendMenuW(menu, sound_flags, CMD_SOUND, w!("Copy sound"));
+            let click_flags = if self.click_reveal { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, click_flags, CMD_CLICK_REVEAL, w!("Reveal on click only"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_CLEAR, w!("Clear history"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit"));
             let mut pt = POINT::default();
@@ -1114,6 +1142,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 CMD_TOGGLE => app.toggle(),
                 CMD_AUTOSTART => {
                     autostart::set_enabled(!autostart::is_enabled());
+                }
+                CMD_CLICK_REVEAL => {
+                    app.click_reveal = !app.click_reveal;
+                    save_click_reveal(app.click_reveal);
                 }
                 CMD_CLEAR => app.clear_history(),
                 CMD_SOUND => {
