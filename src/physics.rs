@@ -178,6 +178,8 @@ const SLIDE_W: f32 = 12.0;
 const RISE_LEAD_W: f32 = 8.5;
 /// A new card starts slightly larger and shrinks onto the line.
 const SCALE_W: f32 = 9.0;
+/// The flight spring's starting value (see `Motion::away`).
+const FLIGHT: f32 = 1000.0;
 /// The newest-card outline fades over about half a second.
 const GLOW_W: f32 = 8.0;
 /// Gravity for the pendulum (DIP/s²): with a card's hanging length this sets its
@@ -222,9 +224,14 @@ pub struct Motion {
     /// Horizontal offset of the clip from the card's slot, in DIPs.
     pub hx: Spring,
     pub hx_target: f32,
-    /// Vertical offset below the rope while a new card flies in (DIPs).
-    lead_y: Spring,
-    pub hy: Spring,
+    /// How much of a new card's flight remains, from `FLIGHT` at the source down
+    /// to 0 on the line (two stages, like the slide). Counted in thousandths so
+    /// the spring's rest threshold is far below a pixel.
+    lead_away: Spring,
+    away: Spring,
+    /// Where the flight started, as a distance below the rope in screen
+    /// coordinates (DIPs; negative above it).
+    rise: f32,
     /// Size above 1.0 while a new card flies in.
     pub grow: Spring,
     /// Pendulum angle about the clip (radians, clockwise positive) and its speed.
@@ -242,14 +249,33 @@ impl Motion {
         self.hx.x += dx;
     }
 
-    /// Start a new card at an offset (`dx`, `dy`) from its place on the line,
-    /// slightly enlarged, so it flies up and clips on.
-    pub fn launch(&mut self, dx: f32, dy: f32, grow: f32) {
+    /// Start a new card `dx` beside its place on the line and `rise` below the
+    /// rope as seen on screen, slightly enlarged, so it flies over and clips on.
+    pub fn launch(&mut self, dx: f32, rise: f32, grow: f32) {
         self.lead.snap(dx);
         self.hx.snap(dx);
-        self.lead_y.snap(dy);
-        self.hy.snap(dy);
+        self.rise = rise;
+        self.lead_away.snap(FLIGHT);
+        self.away.snap(FLIGHT);
         self.grow.snap(grow);
+    }
+
+    /// Share of the flight still to go: 1 at the source, 0 on the line.
+    pub fn away(&self) -> f32 {
+        self.away.x / FLIGHT
+    }
+
+    /// How far below the rope the clip still is because of its flight.
+    pub fn height(&self) -> f32 {
+        self.rise * self.away()
+    }
+
+    /// Where to draw the clip below the rope when the line is shifted by `slide`.
+    /// A card on the line moves with it; one just launched ignores it, so it
+    /// starts at its source however far the line is still raised.
+    pub fn drop_y(&self, slide: f32) -> f32 {
+        let away = self.away();
+        self.rise * away + slide * (1.0 - away)
     }
 
     /// Make `hx` an absolute x position (for a card leaving the line).
@@ -266,8 +292,8 @@ impl Motion {
         let w2 = SLIDE_W;
         let ax = self.hx.step_to(self.lead.x, w2 * w2, 2.0 * w2, dt);
         let wy = RISE_LEAD_W;
-        self.lead_y.step_to(0.0, wy * wy, 2.0 * wy, dt);
-        self.hy.step_to(self.lead_y.x, w2 * w2, 2.0 * w2, dt);
+        self.lead_away.step_to(0.0, wy * wy, 2.0 * wy, dt);
+        self.away.step_to(self.lead_away.x, w2 * w2, 2.0 * w2, dt);
         let ws = SCALE_W;
         self.grow.step_to(0.0, ws * ws, 2.0 * ws, dt);
         let wg = GLOW_W;
@@ -300,8 +326,8 @@ impl Motion {
     pub fn active(&self) -> bool {
         self.lead.active(self.hx_target)
             || self.hx.active(self.hx_target)
-            || self.lead_y.active(0.0)
-            || self.hy.active(0.0)
+            || self.lead_away.active(0.0)
+            || self.away.active(0.0)
             || self.grow.active(0.0)
             || self.glow.active(self.glow_target)
             || self.swing.active(0.0)
@@ -310,10 +336,38 @@ impl Motion {
     pub fn settle(&mut self) {
         self.lead.snap(self.hx_target);
         self.hx.snap(self.hx_target);
-        self.lead_y.snap(0.0);
-        self.hy.snap(0.0);
+        self.lead_away.snap(0.0);
+        self.away.snap(0.0);
         self.grow.snap(0.0);
         self.glow.snap(self.glow_target);
         self.swing = Spring::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_is_independent_of_the_slide() {
+        for rise in [700.0, -60.0, 0.0] {
+            let mut m = Motion::default();
+            m.launch(0.0, rise, 0.25);
+            assert_eq!(m.away(), 1.0);
+            assert_eq!(m.drop_y(-330.0), rise);
+            assert_eq!(m.drop_y(0.0), rise);
+        }
+    }
+
+    #[test]
+    fn landed_card_follows_the_slide() {
+        let mut m = Motion::default();
+        m.launch(40.0, 700.0, 0.25);
+        for _ in 0..2000 {
+            m.step(SUBSTEP, 80.0, 0.0);
+        }
+        assert!(m.height().abs() < 0.5, "height {}", m.height());
+        m.settle();
+        assert_eq!(m.drop_y(-330.0), -330.0);
     }
 }

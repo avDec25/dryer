@@ -5,7 +5,8 @@ A clothesline clipboard history for Windows 11.
 Dryer has no window. A thin rope hangs across the top of your primary monitor, and everything you copy hangs from it on a clothespin. It keeps the last 10 clips. Click a card to put that clip back on the clipboard as the newest item.
 
 - Text, images and copied files each get a card. Card width is fixed; height fits the content, between a minimum and a maximum.
-- The rope sags under the cards, new clips fly up from the pointer, and cards swing from their pegs.
+- The rope sags under the cards, new clips fly in from the spot they were copied from, and cards swing from their pegs.
+- To find that spot, Dryer looks at what Windows reports about the selected text, selected files, images and windows, and notes where you last dragged, clicked and right-clicked, in any app. Those positions stay in memory, are never saved, and the keyboard is not watched. A full-screen capture starts from the middle of the screen.
 - Clips from password managers that ask not to be recorded are skipped.
 - A short beep plays whenever a copy is added to the line (the sound is built into the exe). Switch it off with **Copy sound** in the tray menu; the choice is remembered.
 - The line is remembered across restarts. Clips are saved in `%LOCALAPPDATA%\Dryer\history`, each in its own file encrypted with Windows DPAPI, so only your account on this PC can read them. Use **Clear history** in the tray menu to erase them.
@@ -109,6 +110,8 @@ The feel of the motion is set by a few constants at the top of `src\physics.rs`:
 | `build.rs` | Embeds `icon.ico` in the exe as the application icon (no extra tools needed) |
 | `icon.png` / `icon.ico` | The application icon, and the multi-size version of it built from the PNG |
 | `tools\make-icon.ps1` | Rebuilds `icon.ico` from `icon.png` |
+| `src\origin.rs` | Finding where on screen a copy came from |
+| `src\gesture.rs` | Recent mouse drags and clicks, from Raw Input |
 | `src\autostart.rs` | Start at login (the per-user `Run` registry key) |
 | `src\card.rs` | Card sizes, layout along the line, text layout |
 | `src\render.rs` | Direct2D drawing and DirectComposition setup |

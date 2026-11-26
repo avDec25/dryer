@@ -8,6 +8,7 @@
 mod autostart;
 mod card;
 mod clipboard;
+mod gesture;
 mod origin;
 mod physics;
 mod render;
@@ -29,6 +30,7 @@ use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, GetClipboardSequenceNumber, RemoveClipboardFormatListener,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{
@@ -46,9 +48,10 @@ use windows::core::{PCWSTR, w};
 
 use crate::card::CARD_W;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextLayout;
-use crate::clipboard::{Capture, Clip};
+use crate::clipboard::{Capture, Clip, Copied};
+use crate::gesture::Gestures;
 use crate::physics::{Breeze, Rope, Spring};
-use crate::render::{PEG_DROP, ROPE_Y};
+use crate::render::PEG_DROP;
 use crate::ring::Ring;
 
 /// Tall enough for the tallest card hanging from a sagging rope.
@@ -122,8 +125,8 @@ const MAX_RETRIES: u32 = 5;
 const RESTORE_KICK: f32 = 90.0;
 /// A new card starts this much larger and shrinks onto the line.
 const GROW_START: f32 = 0.25;
-/// A new card always flies at least this far up to the line.
-const MIN_FLIGHT: f32 = 40.0;
+/// A flying card starts to weigh on the rope this close to it.
+const LOAD_REACH: f32 = 40.0;
 
 /// Breeze phase for a card: differs per card, and travels along the line.
 /// Opacity of the toast `t` seconds in: a quick fade in, a hold, a slower fade out.
@@ -148,6 +151,8 @@ struct App {
     engine: card::Engine,
     /// Finds where on screen the copied content was.
     locator: origin::Locator,
+    /// Recent mouse drags and clicks, which show where a copy was made.
+    gestures: Gestures,
     /// Where the history is kept on disk (None if there is no such place).
     store: Option<store::Store>,
     /// The line has changed since it was last saved.
@@ -186,6 +191,9 @@ struct App {
     toast: Option<(u64, Instant)>,
     toast_label: IDWriteTextLayout,
     tracking_mouse: bool,
+    /// Where the next capture comes from, when Dryer itself puts it on the
+    /// clipboard: the card it was copied from (window DIPs).
+    own_origin: Option<(f32, f32)>,
     /// Sequence number produced by our own clipboard write; changes with it are ignored.
     own_seq: u32,
     retries: u32,
@@ -222,6 +230,7 @@ impl App {
             ring: Ring::new(),
             engine,
             locator: origin::Locator::new(),
+            gestures: Gestures::default(),
             store: store::Store::open(),
             dirty: false,
             sound: sound::Sound::new(),
@@ -244,6 +253,7 @@ impl App {
             toast: None,
             toast_label,
             tracking_mouse: false,
+            own_origin: None,
             own_seq: 0,
             retries: 0,
             last_capture: None,
@@ -285,14 +295,16 @@ impl App {
         if !self.want_shown {
             return None;
         }
-        // The picture is shifted by `slide`, so move the point back into line space.
-        render::hit(&self.ring, &self.rope, self.width_dip, x, y - self.slide.x)
+        render::hit(&self.ring, &self.rope, self.width_dip, self.slide.x, x, y)
     }
 
-    /// Where the copied content was on screen, in window DIPs: the selected text, the
-    /// caret or the focused control; failing those, the pointer.
-    fn copy_origin(&self) -> (f32, f32) {
-        match self.locator.locate() {
+    /// Where the copied content was on screen, in window DIPs (see `origin`);
+    /// the pointer if nothing tells.
+    fn copy_origin(&self, copied: Copied) -> (f32, f32) {
+        let (x, y) = (self.origin.x as f64, self.origin.y as f64);
+        let monitor = [x, y, x + self.px_w as f64, y + self.mon_h_px as f64];
+        let now = unsafe { GetTickCount64() };
+        match origin::choose(copied, &self.gestures, now, monitor, &self.locator) {
             Some((x, y)) => self.to_dip(
                 (x - self.origin.x as f32) as i32,
                 (y - self.origin.y as f32) as i32,
@@ -584,11 +596,17 @@ impl App {
             }
         }
         if let Some(scene) = self.scene.as_ref() {
-            let _ = scene.set_offset(self.slide.x * self.scale());
             let toast = self
                 .toast
                 .map(|(hash, at)| (hash, toast_alpha(at.elapsed().as_secs_f32()), &self.toast_label));
-            let drawn = scene.draw(&mut self.ring, &mut self.departing, &self.rope, self.width_dip, toast);
+            let drawn = scene.draw(
+                &mut self.ring,
+                &mut self.departing,
+                &self.rope,
+                self.width_dip,
+                self.slide.x,
+                toast,
+            );
             if drawn.is_err() {
                 // Device lost or target invalid: rebuild on the next frame.
                 self.drop_gpu();
@@ -609,7 +627,7 @@ impl App {
         self.rope.clear_loads();
         for (i, c) in self.ring.iter_mut().enumerate() {
             let cx = card::slot_x(i, n, w) + c.motion.hx.x;
-            let attached = (1.0 - c.motion.hy.x / MIN_FLIGHT).clamp(0.0, 1.0);
+            let attached = (1.0 - c.motion.height().abs() / LOAD_REACH).clamp(0.0, 1.0);
             self.rope.add_load(cx / w, physics::card_load(c.card_h) * attached);
         }
         for c in self.departing.iter() {
@@ -657,7 +675,7 @@ impl App {
         self.departing.retain(|c| c.motion.hx.x > -CARD_W);
 
         // Every new card has reached the rope: the window can shrink back to the band.
-        if self.tall && self.ring.iter_mut().all(|c| c.motion.hy.x < 6.0) {
+        if self.tall && self.ring.iter_mut().all(|c| c.motion.height() < 6.0) {
             self.set_tall(false);
         }
 
@@ -761,8 +779,10 @@ impl App {
                     unsafe { SetTimer(Some(self.hwnd), TIMER_RETRY, RETRY_MS, None) };
                 }
             }
-            Capture::Skip => {}
+            Capture::Skip => self.own_origin = None,
             Capture::Got(mut clip) => {
+                // Taken first, so it can never be applied to a later copy.
+                let own_origin = self.own_origin.take();
                 let echo = self.last_capture.is_some_and(|(h, at)| {
                     h == clip.hash && at.elapsed().as_millis() < SAME_COPY_MS
                 });
@@ -773,18 +793,30 @@ impl App {
                 }
                 // First thing: the beep should come with the copy, not after the animation.
                 self.sound.play();
+                // Look for the source before the line comes down over it.
+                let from = match own_origin {
+                    Some(card) => card,
+                    None => self.copy_origin(clip.copied()),
+                };
                 // Lay out the text and fix the card height once, up front.
                 let _ = self.engine.prepare(&mut clip);
                 // Bring the line down first so the new card is seen arriving.
                 self.reveal();
                 let before = self.positions();
                 let evicted = self.ring.insert(clip);
-                let from = self.copy_origin();
                 self.reflow(&before, evicted, Some(from));
                 self.mark_dirty();
                 self.kick();
             }
         }
+    }
+
+    /// Where the middle of card `idx` is on screen now.
+    fn card_centre(&self, idx: usize) -> Option<(f32, f32)> {
+        let c = self.ring.get(idx)?;
+        let cx = render::ring_cx(c, idx, self.ring.len(), self.width_dip);
+        let hinge = render::rope_y(cx, self.width_dip, &self.rope) + c.motion.drop_y(self.slide.x);
+        Some((cx, hinge + PEG_DROP + c.card_h / 2.0))
     }
 
     /// Show "Copied" under clip `idx` for a moment.
@@ -813,6 +845,7 @@ impl App {
                 // Not marked as our own write: the clipboard listener picks the plain
                 // text up as a new clip, and the original card stays untouched.
                 if clipboard::write(self.hwnd, &text).is_some() {
+                    self.own_origin = self.card_centre(idx);
                     self.show_toast(idx);
                 }
                 return;
@@ -837,8 +870,9 @@ impl App {
     }
 
     /// After the line changes, every card keeps its on-screen position and then
-    /// moves to its new slot. A new card flies up from `arrival` (the pointer);
-    /// an evicted card slides off the left edge.
+    /// moves to its new slot. A newly copied card (slot 0, when `arrival` says
+    /// where it was copied from) flies in from there, even if the same content
+    /// already hung on the line; an evicted card slides off the left edge.
     fn reflow(&mut self, before: &[(u64, f32)], evicted: Option<Clip>, arrival: Option<(f32, f32)>) {
         self.hover = None;
         self.mark_event();
@@ -849,18 +883,20 @@ impl App {
         for i in 0..n {
             let Some(c) = self.ring.get_mut(i) else { continue };
             let base = card::slot_x(i, n, w);
-            match before.iter().find(|(h, _)| *h == c.hash) {
+            let arriving = i == 0 && arrival.is_some();
+            match before.iter().find(|(h, _)| !arriving && *h == c.hash) {
                 Some(&(_, old_x)) => c.motion.shift(old_x - (base + c.motion.hx.x)),
                 None => {
-                    // The card starts where the content was copied from, anywhere on screen.
+                    // The card starts centred where the content was copied from.
                     let (ax, ay) = arrival.unwrap_or((base + CARD_W, 0.0));
-                    let rest_top = ROPE_Y + PEG_DROP;
-                    let dy = (ay - rest_top).clamp(MIN_FLIGHT, (mon_h - rest_top).max(MIN_FLIGHT));
+                    let (ax, ay) = (ax.clamp(0.0, w), ay.clamp(0.0, mon_h));
+                    let rope_there = render::rope_y(ax, w, &self.rope);
+                    let rise = render::rise_to(ay, rope_there, c.card_h, GROW_START);
                     // Below the band? Then the window must cover the screen for the flight.
-                    if rest_top + dy + c.card_h + 20.0 > BAND_DIP {
+                    if ay + c.card_h / 2.0 * (1.0 + GROW_START) + 20.0 > BAND_DIP {
                         needs_tall = true;
                     }
-                    c.motion.launch(ax.clamp(0.0, w) - base, dy, GROW_START);
+                    c.motion.launch(ax - base, rise, GROW_START);
                 }
             }
         }
@@ -1114,6 +1150,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             }
             WM_CLIPBOARDUPDATE => app.on_clipboard_update(),
+            // Mouse buttons used anywhere. Falls through to DefWindowProc, which
+            // releases the input.
+            WM_INPUT => app.gestures.on_input(lp, GetTickCount64()),
             WM_TIMER => match wp.0 {
                 TIMER_FRAME => app.on_frame(),
                 TIMER_RETRY => {
@@ -1243,6 +1282,7 @@ fn main() -> windows::core::Result<()> {
         autostart::refresh();
         app.add_tray();
         let _ = AddClipboardFormatListener(hwnd);
+        gesture::register(hwnd);
         let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_WIN | MOD_SHIFT, 'C' as u32);
         app.reposition();
         // The rope starts taut and drops into its sag as the line glides down.

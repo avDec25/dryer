@@ -58,6 +58,16 @@ pub enum Kind {
     Other,
 }
 
+/// What a clip was copied as, which decides where to look for its source.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Copied {
+    /// Picture data, with its size in pixels when it can be read.
+    Image(Option<(u32, u32)>),
+    Files,
+    /// Text and everything else.
+    Other,
+}
+
 pub struct Clip {
     pub kind: Kind,
     /// Raw clipboard formats, restored verbatim on click.
@@ -87,6 +97,10 @@ pub struct Clip {
 }
 
 impl Clip {
+    pub fn copied(&self) -> Copied {
+        copied(self.kind, &self.formats)
+    }
+
     /// Text that carries more than its plain characters (HTML, RTF, ...), so a
     /// plain-text copy would differ from it. Only the formats Dryer keeps are
     /// stored, so anything besides the Unicode text is formatting.
@@ -95,6 +109,48 @@ impl Clip {
             && self.formats.iter().any(|(f, _)| *f == CF_UNICODETEXT)
             && self.formats.iter().any(|(f, _)| *f != CF_UNICODETEXT)
     }
+}
+
+/// A copied picture file counts as files: it came from wherever the file is shown.
+/// Picture data counts as an image even if a file is named alongside it.
+fn copied(kind: Kind, formats: &[(u32, Vec<u8>)]) -> Copied {
+    let has = |id: u32| formats.iter().any(|(f, _)| *f == id);
+    let size = image_size(formats);
+    let picture_data = has(CF_DIB) || has(CF_DIBV5) || size.is_some();
+    if has(CF_HDROP) && !picture_data {
+        Copied::Files
+    } else if kind == Kind::Image {
+        Copied::Image(size)
+    } else {
+        Copied::Other
+    }
+}
+
+/// Width and height of the picture on the clipboard, from its bitmap or PNG header.
+fn image_size(formats: &[(u32, Vec<u8>)]) -> Option<(u32, u32)> {
+    let field = |b: &[u8], at: usize| -> Option<[u8; 4]> { b.get(at..at + 4)?.try_into().ok() };
+    let dib = |b: &[u8]| {
+        // The older 12-byte header lays its size out differently; nothing writes it now.
+        if u32::from_le_bytes(field(b, 0)?) < 40 {
+            return None;
+        }
+        let w = i32::from_le_bytes(field(b, 4)?).unsigned_abs();
+        // A negative height only means the rows run from the top.
+        let h = i32::from_le_bytes(field(b, 8)?).unsigned_abs();
+        Some((w, h))
+    };
+    let png = |b: &[u8]| {
+        if !b.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return None;
+        }
+        Some((u32::from_be_bytes(field(b, 16)?), u32::from_be_bytes(field(b, 20)?)))
+    };
+    formats
+        .iter()
+        .find_map(|(f, b)| match *f {
+            CF_DIB | CF_DIBV5 => dib(b),
+            _ => png(b),
+        })
 }
 
 pub enum Capture {
@@ -411,6 +467,31 @@ mod tests {
         assert!(!has_pastable_data(&[(unnamed_free, vec![1])]));
         assert!(!has_pastable_data(&[(format_id(w!("Biff12")), Vec::new())]));
         assert!(has_pastable_data(&[(drop_effect, vec![1]), (format_id(w!("Biff12")), vec![1])]));
+    }
+
+    #[test]
+    fn what_was_copied() {
+        let mut dib = vec![0u8; 40];
+        dib[0] = 40;
+        dib[4..8].copy_from_slice(&401i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&(-199i32).to_le_bytes()); // top-down bitmap
+        assert_eq!(copied(Kind::Image, &[(CF_DIB, dib.clone())]), Copied::Image(Some((401, 199))));
+
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend(800u32.to_be_bytes());
+        png.extend(600u32.to_be_bytes());
+        let id = format_id(w!("PNG"));
+        assert_eq!(copied(Kind::Image, &[(id, png)]), Copied::Image(Some((800, 600))));
+        assert_eq!(copied(Kind::Image, &[(id, vec![1, 2])]), Copied::Image(None));
+
+        // A copied image file is a file copy; a bitmap that also names a file is not.
+        assert_eq!(copied(Kind::Image, &[(CF_HDROP, vec![0; 24])]), Copied::Files);
+        assert_eq!(copied(Kind::Files, &[(CF_HDROP, vec![0; 24])]), Copied::Files);
+        assert_eq!(
+            copied(Kind::Image, &[(CF_HDROP, vec![0; 24]), (CF_DIB, dib)]),
+            Copied::Image(Some((401, 199)))
+        );
+        assert_eq!(copied(Kind::Text, &[(CF_UNICODETEXT, vec![0, 0])]), Copied::Other);
     }
 
     #[test]

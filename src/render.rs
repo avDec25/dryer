@@ -1,7 +1,7 @@
 //! Direct2D drawing into a DirectComposition-bound swap chain.
 //! All geometry is in device-independent pixels (DIPs); the context DPI maps them to pixels.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::ffi::c_void;
 
 use windows::Win32::Foundation::{HMODULE, HWND};
@@ -137,18 +137,25 @@ pub fn ring_cx(clip: &Clip, i: usize, n: usize, width: f32) -> f32 {
     slot_x(i, n, width) + clip.motion.hx.x
 }
 
-/// Where the card's clip grips: on the rope, or below it while flying in.
-fn hinge_y(clip: &Clip, cx: f32, width: f32, rope: &Rope) -> f32 {
-    rope_y(cx, width, rope) + clip.motion.hy.x
+/// Where the card's clip grips, in window coordinates: on the rope, which `slide`
+/// shifts up out of view, or between there and its source while flying in.
+fn hinge_y(clip: &Clip, cx: f32, width: f32, rope: &Rope, slide: f32) -> f32 {
+    rope_y(cx, width, rope) + clip.motion.drop_y(slide)
+}
+
+/// The flight height that puts the centre of a card, `grow` larger than normal,
+/// at screen height `source_y` when the rope there is at `rope_y`.
+pub fn rise_to(source_y: f32, rope_y: f32, card_h: f32, grow: f32) -> f32 {
+    source_y - (PEG_DROP + card_h / 2.0) * (1.0 + grow) - rope_y
 }
 
 /// Which card (if any) is under the point. The newest wins where cards overlap.
-pub fn hit(ring: &Ring, rope: &Rope, width: f32, x: f32, y: f32) -> Option<usize> {
+pub fn hit(ring: &Ring, rope: &Rope, width: f32, slide: f32, x: f32, y: f32) -> Option<usize> {
     let n = ring.len();
     (0..n).find(|&i| {
         let Some(clip) = ring.get(i) else { return false };
         let cx = ring_cx(clip, i, n, width);
-        let top = hinge_y(clip, cx, width, rope) + PEG_DROP;
+        let top = hinge_y(clip, cx, width, rope, slide) + PEG_DROP;
         x >= cx - CARD_W / 2.0 && x <= cx + CARD_W / 2.0 && y >= top && y <= top + clip.card_h
     })
 }
@@ -160,8 +167,6 @@ pub struct Scene {
     /// The swap chain's back buffer as a Direct2D target (None while resizing).
     target: Option<ID2D1Bitmap1>,
     dpi: f32,
-    /// Vertical offset of the whole line in pixels (negative slides it up out of view).
-    offset: Cell<f32>,
     /// The toast's shadow bitmap and the toast width it was made for.
     toast_shadow: RefCell<Option<(f32, ID2D1Bitmap1)>>,
     brush: ID2D1SolidColorBrush,
@@ -241,7 +246,6 @@ impl Scene {
                 swap,
                 target: Some(target),
                 dpi: dpi as f32,
-                offset: Cell::new(0.0),
                 toast_shadow: RefCell::new(None),
                 brush,
                 _dcomp: dcomp,
@@ -285,21 +289,9 @@ impl Scene {
         Ok(())
     }
 
-    /// Slide the whole line vertically by `dy` pixels. The compositor moves the
-    /// finished picture, so nothing is redrawn.
-    pub fn set_offset(&self, dy: f32) -> Result<()> {
-        if (self.offset.get() - dy).abs() < 0.01 {
-            return Ok(());
-        }
-        self.offset.set(dy);
-        unsafe {
-            self._visual.SetOffsetY2(dy)?;
-            self._dcomp.Commit()
-        }
-    }
-
     /// Draw one frame. `width` is the window width in DIPs. Clips in `departing`
-    /// use an absolute x (`hx`) and are drawn behind the line.
+    /// use an absolute x (`hx`) and are drawn behind the line. `slide` raises the
+    /// line (negative is up); cards in flight blend into it as they land.
     /// `toast` is the card (by hash) to show "Copied" under, its opacity and its label.
     pub fn draw(
         &self,
@@ -307,6 +299,7 @@ impl Scene {
         departing: &mut [Clip],
         rope: &Rope,
         width: f32,
+        slide: f32,
         toast: Option<(u64, f32, &IDWriteTextLayout)>,
     ) -> Result<()> {
         unsafe {
@@ -331,18 +324,18 @@ impl Scene {
             self.ctx.Clear(Some(&clear as *const D2D1_COLOR_F));
             self.ctx.SetTransform(&Matrix3x2::identity());
 
-            self.draw_rope(width, rope)?;
+            self.draw_rope(width, rope, slide)?;
 
             for clip in departing.iter_mut() {
                 let cx = clip.motion.hx.x;
-                self.draw_card(clip, cx, width, rope)?;
+                self.draw_card(clip, cx, width, rope, slide)?;
             }
             let n = ring.len();
             // Oldest first, so the newest sits on top.
             for i in (0..n).rev() {
                 if let Some(clip) = ring.get_mut(i) {
                     let cx = ring_cx(clip, i, n, width);
-                    self.draw_card(clip, cx, width, rope)?;
+                    self.draw_card(clip, cx, width, rope, slide)?;
                 }
             }
 
@@ -352,7 +345,7 @@ impl Scene {
                     let Some(clip) = ring.get(i) else { continue };
                     if clip.hash == hash {
                         let cx = ring_cx(clip, i, n, width);
-                        let top = hinge_y(clip, cx, width, rope) + PEG_DROP;
+                        let top = hinge_y(clip, cx, width, rope, slide) + PEG_DROP;
                         self.draw_toast(cx, top + clip.card_h + TOAST_GAP, alpha, label)?;
                         break;
                     }
@@ -528,8 +521,8 @@ impl Scene {
 
     /// One card hanging from its clip, scaled while flying in and swung by its pendulum.
     /// The card itself is a cached sprite; only the clip is drawn live.
-    fn draw_card(&self, clip: &mut Clip, cx: f32, width: f32, rope: &Rope) -> Result<()> {
-        let hy = hinge_y(clip, cx, width, rope);
+    fn draw_card(&self, clip: &mut Clip, cx: f32, width: f32, rope: &Rope, slide: f32) -> Result<()> {
+        let hy = hinge_y(clip, cx, width, rope, slide);
         let top = hy + PEG_DROP;
         let left = cx - CARD_W / 2.0;
         let m = hinge_transform(clip.motion.swing.x, 1.0 + clip.motion.grow.x, cx, hy);
@@ -693,12 +686,12 @@ impl Scene {
         Ok(())
     }
 
-    fn draw_rope(&self, width: f32, rope: &Rope) -> Result<()> {
+    fn draw_rope(&self, width: f32, rope: &Rope, slide: f32) -> Result<()> {
         unsafe {
             let pts: Vec<Vector2> = (0..=ROPE_SEGMENTS)
                 .map(|i| {
                     let x = width * i as f32 / ROPE_SEGMENTS as f32;
-                    pt(x, rope_y(x, width, rope))
+                    pt(x, rope_y(x, width, rope) + slide)
                 })
                 .collect();
 
@@ -833,5 +826,18 @@ impl Scene {
                 None::<&ID2D1StrokeStyle>,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn card_centre_starts_on_the_source() {
+        let (source_y, rope, h, g) = (640.0, 19.5, 180.0, 0.25);
+        let rise = rise_to(source_y, rope, h, g);
+        let centre = rope + rise + (PEG_DROP + h / 2.0) * (1.0 + g);
+        assert!((centre - source_y).abs() < 0.001);
     }
 }
